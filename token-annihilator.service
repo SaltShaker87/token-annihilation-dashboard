@@ -1,0 +1,14 @@
+[Unit]
+Description=Token Annihilation Dashboard (Ollama token proxy)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/token-annihilation-dashboard
+# Environment=DASH_BIND=127.0.0.1 PROXY_PORT=11435 DASH_PORT=11480
+ExecStart=/usr/bin/python3 %h/token-annihilation-dashboard/token_annihilator.py
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

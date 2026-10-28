@@ -1,0 +1,10 @@
+{
+  "_note": "USD per 1M tokens, standard list price, short-context tier. Checked 2026-10-28. Edit freely; dashboard reads this on every load.",
+  "models": [
+    {"label": "Claude Opus 5.5", "input_per_mtok": 4.00, "output_per_mtok": 20.00, "source": "https://platform.claude.com/docs/en/about-claude/pricing"},
+    {"label": "Claude Sonnet 5.5", "input_per_mtok": 2.00, "output_per_mtok": 10.00, "source": "https://platform.claude.com/docs/en/about-claude/pricing"},
+    {"label": "GPT-6.1 Sol", "input_per_mtok": 2.00, "output_per_mtok": 10.00, "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"},
+    {"label": "GPT-6.1 Terra", "input_per_mtok": 1.00, "output_per_mtok": 5.00, "source": "https://developers.openai.com/api/docs/models/gpt-6.1-terra"},
+    {"label": "Grok 4.7", "input_per_mtok": 2.00, "output_per_mtok": 6.00, "source": "https://docs.x.ai/developers/pricing"}
+  ]
+}
