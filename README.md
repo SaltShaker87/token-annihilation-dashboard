@@ -1,8 +1,12 @@
 # Token Annihilation Dashboard
 
+<p align="center">
+  <img src="logo.png" alt="A little chip breathing out dollar signs" width="180">
+</p>
+
 Your local GPU is out there annihilating tokens that a cloud provider would have happily billed you for. This keeps score.
 
-A single-file, stdlib-only Python proxy that sits in front of [Ollama](https://ollama.com), [vLLM](https://docs.vllm.ai/), or [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, counts every token that passes through, and serves a gloriously over-the-top dashboard (the "DGX Token Annihilator Dashboard") showing how many cloud dollars you did not set on fire. Built for an NVIDIA DGX Spark. One process can watch all three engines at once.
+A stdlib-only Python program, in one script, that sits in front of [Ollama](https://ollama.com), [vLLM](https://docs.vllm.ai/), or [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, counts every token that passes through, and serves a gloriously over-the-top dashboard (the "DGX Token Annihilator Dashboard") showing how many cloud dollars you did not set on fire. Built for an NVIDIA DGX Spark. One process can watch all three engines at once.
 
 **The local servers are never modified.** No config changes, no restarts, no patches. Each proxy just forwards requests and reads the token receipt on the way back. If a proxy ever dies, point that client back at the server's own port and carry on.
 
@@ -11,6 +15,7 @@ A single-file, stdlib-only Python proxy that sits in front of [Ollama](https://o
 - **Three transparent proxies**, one per engine. Streaming responses pass through chunk by chunk, never buffered. Fails open: if logging breaks, your request still succeeds.
 - Counts tokens for the native routes and the OpenAI-compatible ones, stored in a tiny SQLite file. Ollama's `prompt_eval_count` / `eval_count`, vLLM and llama.cpp OpenAI `usage`, the Responses and Anthropic `input_tokens` / `output_tokens` shapes, and llama.cpp's `tokens_evaluated` / `tokens_predicted` (plus `timings`) are all read. A batch reply is summed. A stream keeps the latest total, so partial chunks are not added twice.
 - **Dashboard on port 11480**: tokens annihilated (input/output), requests, output tokens/sec, daily devastation log, hungriest models, and a card for each engine. Click an engine to see only its score.
+- **The chip mascot** plays in a loop beside the title, and the same picture is the browser tab icon. `logo.png` is a still of him.
 - **GitHub-style contribution calendar** of tokens per day for the last year, in NVIDIA green, with hover tooltips.
 - **Cloud bills obliterated**: estimated savings at list price vs Claude Opus 5.5, Claude Sonnet 5.5, GPT-6.1 Sol, GPT-6.1 Terra and Grok 4.7.
 - **`prices.json`**: USD per 1M input/output tokens, last checked **2026-10-28** against each provider's official pricing page (sources inside). Edit it whenever prices change; the page rereads it on every load.
