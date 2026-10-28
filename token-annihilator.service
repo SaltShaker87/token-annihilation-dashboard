@@ -1,10 +1,12 @@
 [Unit]
-Description=Token Annihilation Dashboard (Ollama token proxy)
+Description=Token Annihilation Dashboard (Ollama, vLLM, and llama.cpp token proxies)
 After=network-online.target
 
 [Service]
 WorkingDirectory=%h/token-annihilation-dashboard
-# Environment=DASH_BIND=127.0.0.1 PROXY_PORT=11435 DASH_PORT=11480
+# Environment=DASH_BIND=127.0.0.1 PROXY_PORT=11435 VLLM_PROXY_PORT=8001 LLAMACPP_PROXY_PORT=8081 DASH_PORT=11480
+# Environment=UPSTREAM_PORT=11434 VLLM_UPSTREAM_PORT=8000 LLAMACPP_UPSTREAM_PORT=8080
+# Environment=ENGINES=ollama,vllm,llamacpp
 ExecStart=/usr/bin/python3 %h/token-annihilation-dashboard/token_annihilator.py
 Restart=always
 RestartSec=5
