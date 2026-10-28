@@ -384,6 +384,8 @@ def _engine_phrase(e, code):
 
 STYLE = """
 body{font-family:system-ui,sans-serif;background:#0b0d10;color:#e6e6e6;padding:24px;max-width:1000px;margin:auto}
+.hero{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.mascot{width:96px;height:96px;flex:none;background:#000;border-radius:20px}
 h1{font-weight:800;margin:0 0 4px;color:#76B900;letter-spacing:.02em} h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;margin:28px 0 10px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px} .card{background:#14171d;border:1px solid #232833;border-radius:12px;padding:14px}
 .big{font-size:26px;font-weight:700;color:#76B900} .lbl{color:#9aa3b5;font-size:13px} .muted{color:#6b7285;font-size:12px}
@@ -449,7 +451,7 @@ def page(backend=None):
     if backend:
         view += " <a href='/'>Show every engine</a>."
     T = "DGX Token Annihilator Dashboard"
-    return f"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60><title>{T}</title><style>{STYLE}</style></head><body><h1>{T}</h1><div class=muted>Every token that passes a proxy is a token the cloud will never bill you for. The local servers are left untouched. Last carnage report: {datetime.now():%b %d %H:%M}.</div>
+    return f"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60><link rel=icon href="/mascot.gif" type="image/gif"><title>{T}</title><style>{STYLE}</style></head><body><div class=hero><img class=mascot src="/mascot.gif" alt="A little chip breathing out dollar signs"><div><h1>{T}</h1><div class=muted>Every token that passes a proxy is a token the cloud will never bill you for. The local servers are left untouched. Last carnage report: {datetime.now():%b %d %H:%M}.</div></div></div>
 {nav}
 <h2>Engines of destruction</h2><div class=grid>{cards}</div>
 <div class=muted style="margin-top:8px">Send each app to the proxy port, not the server port. {view}</div>
@@ -466,6 +468,15 @@ def page(backend=None):
 class Dash(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path.rstrip("/") == "/mascot.gif":
+            try:
+                with open(os.path.join(HOME, "mascot.gif"), "rb") as f: b = f.read()
+                code, ctype = 200, "image/gif"
+            except Exception as e:
+                b, code, ctype = ("error: %s" % e).encode(), 404, "text/plain; charset=utf-8"
+            self.send_response(code); self.send_header("Content-Type", ctype); self.send_header("Cache-Control", "public, max-age=86400"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
         backend = None
         try:
             backend = (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("backend") or [None])[0]
