@@ -70,7 +70,7 @@ OpenAI-style clients: base URL `http://127.0.0.1:11435/v1`. Not using Ollama? Se
 
 ### vLLM
 
-On by default: a counting proxy on **8001** forwards to vLLM on 8000. Point your clients at `http://127.0.0.1:8001/v1`. Different ports or host (say vLLM runs across two Sparks with the API on the head node):
+Automatic: as soon as vLLM answers on port 8000, a counting proxy opens on **8001** in front of it (checked every 30 s, so vLLM can start after the dashboard). Point your clients at `http://127.0.0.1:8001/v1`. Different ports or host (say vLLM runs across two Sparks with the API on the head node):
 
 ```bash
 OPENAI_PROXIES="vllm:8001=spark-1:8000" python3 token_annihilator.py
@@ -91,7 +91,7 @@ Two options, use either or both:
 
    The file is polled every `LLAMA_POLL_S` seconds (default 15), and the model name comes from the GGUF file name. To import a log that already exists, run `python3 token_annihilator.py --llama-backfill` once.
 
-2. **Counting proxy**, on by default on **8081** -> 8080 (switched off automatically when `LLAMA_LOG` is set), then use port 8081.
+2. **Counting proxy**, opened automatically on **8081** once llama-server answers on 8080 (not when `LLAMA_LOG` is set), then use port 8081.
 
 Don't count the same server both ways at once, or its tokens are counted twice.
 
@@ -107,7 +107,7 @@ Raw Triton KServe (`/v2/models/.../generate`) and in-process ONNX Runtime return
 
 ### Several runtimes at once
 
-Ollama (11435), vLLM (8001) and llama.cpp (8081) proxies all start by default, so running a big vLLM model and a small Ollama model side by side needs no config. Setting `OPENAI_PROXIES` replaces the vLLM/llama.cpp defaults with exactly what you list. The 11435 proxy labels itself by whatever actually answers upstream (if you point `UPSTREAM_PORT` at vLLM it says vLLM, not Ollama); force it with `PROXY_SOURCE`.
+The Ollama proxy (11435) starts by default. The vLLM (8001) and llama.cpp (8081) proxies open on their own once a real vLLM or llama-server answers on 8000 / 8080, so running a big vLLM model and a small Ollama model side by side needs no config, and an unrelated app on 8000 or 8080 is never proxied or exposed. Setting `OPENAI_PROXIES` replaces those automatic proxies with exactly what you list, started right away with no detection (`OPENAI_PROXIES=` with nothing after it turns them all off). The 11435 proxy labels itself by whatever actually answers upstream (if you point `UPSTREAM_PORT` at vLLM it says vLLM, not Ollama); force it with `PROXY_SOURCE`.
 
 Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAMACPP_*` settings still work, and rows it saved are relabelled from Ollama to their real runtime the first time this version starts.
 
@@ -119,7 +119,7 @@ Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAM
 | `PROXY_BIND` / `PROXY_PORT` | `0.0.0.0` / `11435` | Ollama proxy listen address |
 | `UPSTREAM_HOST` / `UPSTREAM_PORT` | `127.0.0.1` / `11434` | Where Ollama lives |
 | `OLLAMA_PROXY` | `1` | `0` disables the Ollama proxy |
-| `OPENAI_PROXIES` | `vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080` | `source:listen_port=upstream_host:port`, comma-separated. Set empty for none |
+| `OPENAI_PROXIES` | unset: `vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080`, each opened only once that runtime is detected | `source:listen_port=upstream_host:port`, comma-separated, started right away. Set empty for none |
 | `PROXY_SOURCE` | detected | Force the label of the 11435 proxy (`ollama`, `vllm`, ...) |
 | `ENGINES` | `ollama,vllm,llamacpp` | Older-build switch; used only when `OPENAI_PROXIES` is unset |
 | `INJECT_USAGE` | `1` | Ask streaming `/v1` requests to include usage |

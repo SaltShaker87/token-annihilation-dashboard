@@ -5,7 +5,8 @@ After=network-online.target
 [Service]
 WorkingDirectory=%h/token-annihilation-dashboard
 # Uncomment and edit what you use (see README):
-# Ollama :11435, vLLM :8001 and llama.cpp :8081 proxies run by default. To list your own (e.g. vLLM + NVIDIA NIM):
+# Ollama :11435 runs by default; vLLM :8001 / llama.cpp :8081 open once vLLM / llama-server answer on 8000 / 8080.
+# To list your own instead (started right away, e.g. vLLM + NVIDIA NIM):
 # Environment=OPENAI_PROXIES=vllm:8001=127.0.0.1:8000,nim:8002=127.0.0.1:9000
 # Environment=LLAMA_LOG=%h/llama_server.log
 # Environment=OLLAMA_PROXY=0

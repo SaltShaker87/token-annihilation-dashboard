@@ -246,6 +246,10 @@ def check_runtimes():
     for rt in RUNTIMES:
         if rt.get("error"): continue
         kind = probe(*rt["up"])
+        if not rt["started"]:   # a default proxy claims its port only once the right runtime answers upstream
+            if kind == rt["src"]: bind_proxy(rt)
+            rt["ok"], rt["kind"] = rt["started"], kind
+            continue
         rt["ok"], rt["kind"] = kind is not None, kind
         # the :11435 proxy is Ollama's by default, but people point it at vLLM too: label by what actually answers
         if rt["cls"] is Proxy and not PROXY_SOURCE and kind in ("ollama", "vllm", "llamacpp"):
@@ -273,13 +277,25 @@ def proxy_specs():
         out.append("llamacpp:%s=%s:%s" % (e("LLAMACPP_PROXY_PORT", "8081"), e("LLAMACPP_UPSTREAM_HOST", "127.0.0.1"), e("LLAMACPP_UPSTREAM_PORT", "8080")))
     return ",".join(out)
 
-def start_proxy(cls, src, port, up):
-    rt = {"src": src, "listen": port, "up": up, "cls": cls, "ok": None, "kind": None}
+LEGACY_ENV = ("ENGINES", "VLLM_PROXY_PORT", "VLLM_UPSTREAM_HOST", "VLLM_UPSTREAM_PORT", "LLAMACPP_PROXY_PORT", "LLAMACPP_UPSTREAM_HOST", "LLAMACPP_UPSTREAM_PORT")
+def auto_proxies():
+    """Nothing configured: the vLLM / llama.cpp proxies are only defaults, so wait until the right runtime is detected
+    upstream. Otherwise a default could grab a port someone else uses, or forward (on PROXY_BIND) to an unrelated app on 8000/8080."""
+    return OPENAI_PROXIES is None and not any(k in os.environ for k in LEGACY_ENV)
+
+def start_proxy(cls, src, port, up, auto=False):
+    rt = {"src": src, "listen": port, "up": up, "cls": cls, "ok": None, "kind": None, "started": False, "srv": None}
     RUNTIMES.append(rt)
-    try: srv = TS((PROXY_BIND, port), cls)
+    if auto: print(f"{SOURCE_LABELS.get(src, src)} proxy {PROXY_BIND}:{port} starts once {SOURCE_LABELS.get(src, src)} answers at {up[0]}:{up[1]}", flush=True)
+    else: bind_proxy(rt)
+
+def bind_proxy(rt):
+    src, port, up = rt["src"], rt["listen"], rt["up"]
+    try: srv = TS((PROXY_BIND, port), rt["cls"])
     except OSError as e:
         rt["error"] = "port %d busy" % port
         print(f"{SOURCE_LABELS.get(src, src)} proxy NOT started, port {port}: {e}", file=sys.stderr, flush=True); return
+    rt["started"], rt["srv"] = True, srv
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"{SOURCE_LABELS.get(src, src)} proxy {PROXY_BIND}:{port} -> {up[0]}:{up[1]}", flush=True)
 
@@ -890,7 +906,7 @@ if __name__ == "__main__":
     for spec in filter(None, (x.strip() for x in proxy_specs().split(","))):
         src, _, rest = spec.partition(":"); lp, _, upstream = rest.partition("="); uh, _, upp = upstream.rpartition(":")
         H = type("Proxy_" + src, (Proxy,), {"UPH": uh or "127.0.0.1", "UPP": int(upp), "SRC": src})
-        start_proxy(H, src, int(lp), (H.UPH, H.UPP))
+        start_proxy(H, src, int(lp), (H.UPH, H.UPP), auto=auto_proxies())
     print(f"dashboard http://{DASH_BIND}:{DASH_PORT}", flush=True)
     if OLLAMA_PROXY:
         if PROXY_SOURCE: Proxy.SRC = "proxy" if PROXY_SOURCE == "ollama" else PROXY_SOURCE

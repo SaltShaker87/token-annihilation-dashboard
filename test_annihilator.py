@@ -93,6 +93,9 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(ta.proxy_specs(), "vllm:9001=127.0.0.1:9000,llamacpp:8081=127.0.0.1:8080")
             ta.LLAMA_LOG = "/tmp/x.log"; self.assertEqual(ta.proxy_specs(), "vllm:9001=127.0.0.1:9000")   # log tail counts llama.cpp
             ta.OPENAI_PROXIES = ""; self.assertEqual(ta.proxy_specs(), "")   # explicitly empty = none
+            ta.OPENAI_PROXIES = None; self.assertFalse(ta.auto_proxies())   # VLLM_* set: the user asked for it, start now
+            for k in ta.LEGACY_ENV: os.environ.pop(k, None)
+            self.assertTrue(ta.auto_proxies())   # nothing configured: defaults wait for detection
         finally:
             ta.OPENAI_PROXIES, ta.ENGINES, ta.LLAMA_LOG = saved[:3]; os.environ.clear(); os.environ.update(saved[3])
 
@@ -209,11 +212,27 @@ class ProxyTests(unittest.TestCase):
     def test_default_proxy_pointed_at_vllm_is_labelled_vllm(self):
         saved = list(ta.RUNTIMES)
         try:
-            ta.RUNTIMES[:] = [{"src": "proxy", "listen": 1, "up": ("127.0.0.1", self.up["vllm"]), "cls": ta.Proxy}]
+            ta.RUNTIMES[:] = [{"src": "proxy", "listen": 1, "up": ("127.0.0.1", self.up["vllm"]), "cls": ta.Proxy, "started": True}]
             ta.check_runtimes(); self.assertEqual(ta.Proxy.SRC, "vllm")
             ta.RUNTIMES[0]["up"] = ("127.0.0.1", self.up["ollama"])
             ta.check_runtimes(); self.assertEqual(ta.Proxy.SRC, "proxy")
         finally: ta.RUNTIMES[:] = saved; ta.Proxy.SRC = "proxy"
+
+    def test_default_proxy_waits_for_the_right_runtime(self):
+        saved, bind = list(ta.RUNTIMES), ta.PROXY_BIND
+        try:
+            ta.RUNTIMES[:] = []; ta.PROXY_BIND = "127.0.0.1"
+            H = type("Proxy_vllm", (ta.Proxy,), {"UPH": "127.0.0.1", "UPP": self.up["llamacpp"], "SRC": "vllm"})
+            ta.start_proxy(H, "vllm", 18190, ("127.0.0.1", self.up["llamacpp"]), auto=True)   # something else answers there
+            ta.check_runtimes(); rt = ta.RUNTIMES[0]
+            self.assertFalse(rt["started"]); self.assertFalse(rt["ok"])
+            with self.assertRaises(OSError): req(18190, "GET", "/v1/models")   # port left alone
+            rt["up"] = ("127.0.0.1", self.up["vllm"]); ta.check_runtimes()   # vLLM shows up later
+            self.assertTrue(rt["started"]); self.assertTrue(rt["ok"])
+        finally:
+            for rt in ta.RUNTIMES:
+                if rt.get("srv"): rt["srv"].shutdown(); rt["srv"].server_close()
+            ta.RUNTIMES[:] = saved; ta.PROXY_BIND = bind
 
     def test_streamed_vllm_gets_speed(self):
         while self.servers["vllm"].queue["/v1/chat/completions"][:-1]: self.servers["vllm"].queue["/v1/chat/completions"].pop(0)   # if run alone
