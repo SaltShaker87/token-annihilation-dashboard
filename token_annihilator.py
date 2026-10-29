@@ -12,7 +12,11 @@ PRICES = os.path.join(HOME, "prices.json")
 DB = os.environ.get("STATS_DB", DB)
 UP_HOST, UP_PORT = os.environ.get("UPSTREAM_HOST", "127.0.0.1"), int(os.environ.get("UPSTREAM_PORT", 11434))   # Ollama
 PROXY_BIND, PROXY_PORT = os.environ.get("PROXY_BIND", "0.0.0.0"), int(os.environ.get("PROXY_PORT", 11435))
-OLLAMA_PROXY = os.environ.get("OLLAMA_PROXY", "1") != "0"   # set 0 if you only run vLLM / llama.cpp
+# Older builds picked runtimes with ENGINES=ollama,vllm,llamacpp (+ VLLM_* / LLAMACPP_* ports). Still honoured.
+ENGINES = [{"llama.cpp": "llamacpp", "llama-cpp": "llamacpp", "llama": "llamacpp"}.get(x.strip().lower(), x.strip().lower())
+           for x in os.environ.get("ENGINES", "ollama,vllm,llamacpp").split(",") if x.strip()]
+OLLAMA_PROXY = os.environ.get("OLLAMA_PROXY", "1" if "ollama" in ENGINES else "0") != "0"   # set 0 if you only run vLLM / llama.cpp
+PROXY_SOURCE = os.environ.get("PROXY_SOURCE", "")   # force the label of the :11435 proxy (default: detect what answers upstream)
 
 def _default_bind():
     try:
@@ -23,9 +27,10 @@ def _default_bind():
 DASH_BIND, DASH_PORT = os.environ.get("DASH_BIND") or _default_bind(), int(os.environ.get("DASH_PORT", 11480))
 # Extra OpenAI-compatible counting proxies (vLLM, llama-server, anything that returns a "usage" field):
 #   OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080"   (source:listen_port=upstream_host:port)
-OPENAI_PROXIES = os.environ.get("OPENAI_PROXIES", "")
+# Unset = the defaults above (vLLM on 8001, llama.cpp on 8081), so several runtimes at once just work. Set it empty for none.
+OPENAI_PROXIES = os.environ.get("OPENAI_PROXIES")
 INJECT_USAGE = os.environ.get("INJECT_USAGE", "1") != "0"   # add stream_options.include_usage to streaming /v1 requests
-TRACK = ("/api/generate", "/api/chat", "/v1/chat/completions", "/v1/completions", "/api/embed", "/api/embeddings", "/v1/embeddings")
+TRACK = ("/api/generate", "/api/chat", "/v1/chat/completions", "/v1/completions", "/v1/responses", "/api/embed", "/api/embeddings", "/v1/embeddings")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-connection"}
 lock = threading.Lock()
 LIVE = {}            # request id -> {model, endpoint, out_est, t0}
@@ -45,14 +50,22 @@ def db():
 
 # Rows that count. Only the token-less journal backfill is hidden; any future source (e.g. llama.cpp) is included automatically.
 V = "source!='backfill'"
-SOURCE_LABELS = {"proxy": "Ollama", "llamacpp": "llama.cpp", "vllm": "vLLM"}
+SOURCE_LABELS = {"proxy": "Ollama", "ollama": "Ollama", "llamacpp": "llama.cpp", "vllm": "vLLM", "nim": "NVIDIA NIM", "nemo": "NeMo",
+                 "trtllm": "TensorRT-LLM", "triton": "Triton", "onnx": "ONNX Runtime", "sglang": "SGLang", "lmstudio": "LM Studio",
+                 "openai": "OpenAI-compatible"}   # any other OPENAI_PROXIES name is shown as written
 TOT = [0, 0]         # running all-time (input, output) for milestone checks
+RUNTIMES = []        # every proxy we run: {"src", "listen", "up", "cls", "ok", "kind", "error"}
 
 def init_db():
     c = db()
     c.executescript("""CREATE TABLE IF NOT EXISTS milestones(key TEXT PRIMARY KEY, kind TEXT, value REAL, reached_ts REAL, acked_ts REAL);
       CREATE TABLE IF NOT EXISTS trips(id INTEGER PRIMARY KEY, name TEXT, start_ts REAL, end_ts REAL);
-      CREATE INDEX IF NOT EXISTS req_ts ON requests(ts);""")
+      CREATE INDEX IF NOT EXISTS req_ts ON requests(ts); CREATE INDEX IF NOT EXISTS req_src ON requests(source);""")
+    # The older multi-engine build logged every proxy as source='proxy' and kept the runtime in a `backend` column,
+    # which made vLLM / llama.cpp traffic show up as Ollama. Move those rows to their real source (idempotent).
+    if "backend" in [r[1] for r in c.execute("PRAGMA table_info(requests)")]:
+        n = c.execute("UPDATE requests SET source=backend WHERE source='proxy' AND backend IN ('vllm','llamacpp')").rowcount
+        if n: print("relabelled %d older vLLM / llama.cpp rows that were shown as Ollama" % n, flush=True)
     if not c.execute("SELECT 1 FROM trips WHERE end_ts IS NULL").fetchone():
         first = c.execute(f"SELECT MIN(ts) FROM requests WHERE {V}").fetchone()[0]
         c.execute("INSERT INTO trips(name,start_ts) VALUES(NULL,?)", (first or time.time(),))
@@ -114,7 +127,12 @@ def parse_usage(endpoint, req_body, tail):
             inp, out = o.get("prompt_eval_count"), o.get("eval_count")
             if o.get("eval_duration"): eval_s = o["eval_duration"] / 1e9
             break
+        if isinstance(o.get("response"), dict):   # /v1/responses stream: the usage rides on response.completed
+            o = o["response"]; model = o.get("model") or model
         u = o.get("usage")
+        if isinstance(u, dict) and "input_tokens" in u:   # Responses API naming
+            inp, out = u.get("input_tokens"), u.get("output_tokens", 0)
+            break
         if isinstance(u, dict):
             inp, out = u.get("prompt_tokens"), u.get("completion_tokens", 0)
             tm = o.get("timings")   # llama-server extra
@@ -124,7 +142,7 @@ def parse_usage(endpoint, req_body, tail):
 
 def add_usage_opt(path, body):
     """vLLM / llama-server only report usage on a stream when asked. Ask politely; never break the request."""
-    if not INJECT_USAGE or not body or not path.startswith("/v1/") or "embed" in path: return body
+    if not INJECT_USAGE or not body or not path.startswith("/v1/") or "embed" in path or path.endswith("/responses"): return body
     try:
         j = json.loads(body)
         if isinstance(j, dict) and j.get("stream") and "stream_options" not in j:
@@ -159,14 +177,16 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         tail = bytearray()
         rid = None
+        src = self.SRC
+        streamed, t_first, t_last, nchunks = False, None, None, 0
         if track:
             try:
                 m = None
-                try: m = json.loads(body or b"{}").get("model")
+                try: j = json.loads(body or b"{}"); m = j.get("model"); streamed = j.get("stream") is True
                 except Exception: pass
                 with LIVE_LOCK:
                     _rid[0] += 1; rid = _rid[0]
-                    LIVE[rid] = {"model": m, "endpoint": path, "out_est": 0, "t0": t0}; live_bump()
+                    LIVE[rid] = {"model": m, "endpoint": path, "out_est": 0, "t0": t0, "src": src}; live_bump()
             except Exception: rid = None
         try:
             while True:
@@ -177,9 +197,10 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 if track:
                     tail += chunk
+                    t_last = time.time(); t_first = t_first or t_last; nchunks += 1
                     if rid is not None and CLIENTS[0]:
-                        try:
-                            LIVE[rid]["out_est"] += chunk.count(b"\n") or 1; live_bump()
+                        try:   # SSE (vLLM / llama-server) = one "data:" event per token; Ollama NDJSON = one line per token
+                            LIVE[rid]["out_est"] += chunk.count(b"data:") or chunk.count(b"\n") or 1; live_bump()
                         except Exception: pass
                     if len(tail) > 4_000_000: del tail[:-262144]
             if chunked: self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
@@ -188,16 +209,79 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         if track:
             try:
                 model, inp, out, eval_s = parse_usage(path, body, bytes(tail))
-                new_ms = log_row(ts=t0, model=model, endpoint=path, inp=inp, out=out, dur=time.time() - t0, eval_s=eval_s, status=r.status, source=self.SRC)
+                if eval_s is None and streamed and (out or 0) >= 2 and nchunks >= 3 and t_last > t_first:
+                    # vLLM reports no timings. The first chunk lands after prefill, so first->last chunk is decode time
+                    # for out-1 tokens; scale it up to all out tokens.
+                    eval_s = (t_last - t_first) * out / (out - 1)
+                new_ms = log_row(ts=t0, model=model, endpoint=path, inp=inp, out=out, dur=time.time() - t0, eval_s=eval_s, status=r.status, source=src)
                 with LIVE_LOCK:
                     LIVE.pop(rid, None); live_bump()
-                    DONE.append((LIVE_VER[0], {"model": model, "endpoint": path, "in": inp or 0, "out": out or 0, "dur": round(time.time() - t0, 2), "eval_s": eval_s, "src": self.SRC, "ms": new_ms}))
+                    DONE.append((LIVE_VER[0], {"model": model, "endpoint": path, "in": inp or 0, "out": out or 0, "dur": round(time.time() - t0, 2), "eval_s": eval_s, "src": src, "ms": new_ms}))
                     del DONE[:-20]
             except Exception as e: print("parse error:", e, file=sys.stderr)
             finally:
                 if rid is not None and rid in LIVE:
                     LIVE.pop(rid, None); live_bump()
     do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = do_OPTIONS = do_PATCH = handle_any
+
+def probe(host, port):
+    """Who answers at host:port? 'ollama' / 'vllm' / 'llamacpp', 'up' (something else), or None (nothing)."""
+    def get(path):
+        c = http.client.HTTPConnection(host, port, timeout=2)
+        try: c.request("GET", path); r = c.getresponse(); return r.status, r.read(1_000_000)
+        finally: c.close()
+    try:
+        s, b = get("/api/version")
+        if s == 200 and b'"version"' in b: return "ollama"
+        s, b = get("/v1/models")
+        try: owners = {str(m.get("owned_by", "")).lower() for m in json.loads(b).get("data", [])} if s == 200 else set()
+        except Exception: owners = set()
+        for k in ("vllm", "llamacpp"):
+            if k in owners: return k
+        return "up"
+    except Exception:
+        return None
+
+def check_runtimes():
+    for rt in RUNTIMES:
+        if rt.get("error"): continue
+        kind = probe(*rt["up"])
+        rt["ok"], rt["kind"] = kind is not None, kind
+        # the :11435 proxy is Ollama's by default, but people point it at vLLM too: label by what actually answers
+        if rt["cls"] is Proxy and not PROXY_SOURCE and kind in ("ollama", "vllm", "llamacpp"):
+            Proxy.SRC = rt["src"] = "proxy" if kind == "ollama" else kind
+
+def runtimes_loop():
+    while True:
+        try: check_runtimes()
+        except Exception as e: print("runtime check error:", e, file=sys.stderr)
+        time.sleep(30)
+
+def runtimes_info(c):
+    """`used`: it has counted tokens before, so it being down is news (an unused default proxy being down is not)."""
+    used = lambda s: bool(c.execute("SELECT 1 FROM requests WHERE source=? LIMIT 1", (s,)).fetchone())
+    return [{"label": SOURCE_LABELS.get(rt["src"], rt["src"]), "listen": rt["listen"], "up": "%s:%d" % rt["up"],
+             "ok": rt.get("ok"), "error": rt.get("error"), "used": used(rt["src"])} for rt in RUNTIMES]
+
+def proxy_specs():
+    """OPENAI_PROXIES if set; otherwise the older build's defaults / VLLM_* / LLAMACPP_* env vars."""
+    if OPENAI_PROXIES is not None: return OPENAI_PROXIES
+    e, out = os.environ.get, []
+    if "vllm" in ENGINES:
+        out.append("vllm:%s=%s:%s" % (e("VLLM_PROXY_PORT", "8001"), e("VLLM_UPSTREAM_HOST", "127.0.0.1"), e("VLLM_UPSTREAM_PORT", "8000")))
+    if "llamacpp" in ENGINES and not LLAMA_LOG:   # tailing the log already counts it; don't count twice
+        out.append("llamacpp:%s=%s:%s" % (e("LLAMACPP_PROXY_PORT", "8081"), e("LLAMACPP_UPSTREAM_HOST", "127.0.0.1"), e("LLAMACPP_UPSTREAM_PORT", "8080")))
+    return ",".join(out)
+
+def start_proxy(cls, src, port, up):
+    rt = {"src": src, "listen": port, "up": up, "cls": cls, "ok": None, "kind": None}
+    RUNTIMES.append(rt)
+    try: srv = TS((PROXY_BIND, port), cls)
+    except OSError as e:
+        rt["error"] = "port %d busy" % port
+        print(f"{SOURCE_LABELS.get(src, src)} proxy NOT started, port {port}: {e}", file=sys.stderr, flush=True); return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"{SOURCE_LABELS.get(src, src)} proxy {PROXY_BIND}:{port} -> {up[0]}:{up[1]}", flush=True)
 
 GIN = re.compile(r'\[GIN\] (\d{4}/\d\d/\d\d - \d\d:\d\d:\d\d) \| (\d+) \|\s+([\d.]+)(ns|µs|us|ms|s|m)?\S* \|\s+(\S+) \| (\w+)\s+"([^"]+)"')
 UNIT = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1, "m": 60, None: 1}
@@ -309,15 +393,18 @@ def stats(c, since=None):
     rng = {"since": since, "tin": ri, "tout": ro, "nreq": rn, "ev_out": re_[0], "ev_s": re_[1]}
     # trips
     def tt(a, b):
-        i, o, n = c.execute(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*) FROM requests WHERE {V} AND ts>=? AND ts<?", (a, b or 1e13)).fetchone()
-        return {"tin": i, "tout": o, "n": n, "usd": usd(hp, i, o)}
+        i, o, n, eo, es = c.execute(f"""SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COUNT(*),
+          COALESCE(SUM(CASE WHEN eval_s>0 AND output_tokens>0 THEN output_tokens END),0),COALESCE(SUM(CASE WHEN eval_s>0 AND output_tokens>0 THEN eval_s END),0)
+          FROM requests WHERE {V} AND ts>=? AND ts<?""", (a, b or 1e13)).fetchone()
+        return {"tin": i, "tout": o, "n": n, "usd": usd(hp, i, o), "ev_out": eo, "ev_s": es}
     trip = None; hist = []
     for tid, name, a, b in q("SELECT id,name,start_ts,end_ts FROM trips ORDER BY id DESC LIMIT 13"):
         d = {"id": tid, "name": name, "start_ts": a, "end_ts": b, **tt(a, b)}
         if b is None and trip is None: trip = d
         elif b is not None: hist.append(d)
     ms = [{"key": k, "kind": kd, "value": v, "reached_ts": rt, "acked": at is not None} for k, kd, v, rt, at in q("SELECT key,kind,value,reached_ts,acked_ts FROM milestones ORDER BY reached_ts, value")]
-    return {"records": R, "leaderboard": board(W) if since else L, "rng": rng, "sources": sources, "trip": trip, "trips": hist[:12], "milestones": ms}
+    return {"records": R, "leaderboard": board(W) if since else L, "rng": rng, "sources": sources, "trip": trip, "trips": hist[:12], "milestones": ms,
+            "runtimes": runtimes_info(c)}
 
 def page_data():
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
@@ -357,8 +444,9 @@ def page():
 def live_state():
     now = time.time()
     with LIVE_LOCK:
-        streams = [{"id": k, "model": v["model"], "endpoint": v["endpoint"], "out_est": v["out_est"], "elapsed": round(now - v["t0"], 1)} for k, v in LIVE.items()]
-        done = list(DONE)
+        streams = [{"id": k, "model": v["model"], "endpoint": v["endpoint"], "out_est": v["out_est"], "elapsed": round(now - v["t0"], 1),
+                    "src": SOURCE_LABELS.get(v.get("src"), v.get("src"))} for k, v in LIVE.items()]
+        done = [(v, dict(x, src=SOURCE_LABELS.get(x.get("src"), x.get("src")))) for v, x in DONE]
     return streams, done
 
 STATIC_TYPES = {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm"}
@@ -442,11 +530,16 @@ h1{font-weight:800;margin:0;color:var(--g);letter-spacing:.02em}.brand{display:f
 .badge{border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;border:1px solid #2f4a10;color:#9fd14a;background:#13200a}.badge.off{color:#ffb84d;background:#2a1d00;border-color:#6b4a00}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;margin:0 0 8px}h3{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;margin:26px 0 8px}
 .muted{color:#6b7285;font-size:12px}.card{background:#14171d;border:1px solid #232833;border-radius:14px;padding:14px;position:relative;overflow:hidden}
-.row{display:grid;gap:14px;margin-top:14px}.r1{grid-template-columns:1.6fr 1fr 1fr;align-items:start}.r2{grid-template-columns:1.6fr 2fr}
+.row{display:grid;gap:14px;margin-top:14px}.r1{grid-template-columns:1.6fr 1fr 1fr;align-items:stretch}.r2{grid-template-columns:1.6fr 2fr}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
-.odo{display:flex;gap:3px;font:700 54px/1 ui-monospace,Menlo,monospace;color:var(--g);margin:6px 0}
-.dig{height:58px;width:36px;overflow:hidden;background:#0b0d10;border-radius:6px;border:1px solid #1f232d}.dig div{transition:transform .35s cubic-bezier(.2,.8,.2,1)}.dig span{display:block;height:58px;line-height:58px;text-align:center}
-.sep{width:12px;height:58px;display:flex;align-items:flex-end;justify-content:center;padding-bottom:6px;font-size:40px;line-height:1;color:#3f7a00}
+.odo{--dw:36px;--dh:58px;display:flex;align-items:center;gap:3px;font:700 calc(var(--dh)*.93)/1 ui-monospace,Menlo,monospace;color:var(--g);margin:6px 0;max-width:100%}
+.dig{height:var(--dh);width:var(--dw);flex:none;overflow:hidden;background:#0b0d10;border-radius:6px;border:1px solid #1f232d}.dig div{transition:transform .35s cubic-bezier(.2,.8,.2,1)}.dig span{display:block;height:var(--dh);line-height:var(--dh);text-align:center}
+.sep{width:calc(var(--dw)/3);flex:none;height:var(--dh);display:flex;align-items:flex-end;justify-content:center;padding-bottom:calc(var(--dh)/10);font-size:calc(var(--dh)*.69);line-height:1;color:#3f7a00}
+.unit{flex:none;margin-left:8px;font:800 13px system-ui,sans-serif;letter-spacing:.08em;color:#0b0d10;background:var(--g);border-radius:6px;padding:4px 7px}.words{color:#9fd14a;font-size:13px;font-weight:600}
+.scroll{max-height:380px;overflow:auto;border-radius:10px;scrollbar-color:#2f4a10 #0b0d10}.scroll .muted td{position:sticky;top:0;background:#14171d;z-index:1}#ledger{max-height:420px}#ledger .muted td{background:#0b0d10}
+.rts{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;margin-left:auto}.chip.down{border-style:dashed;color:#6b7285;border-color:#2a2f3a;background:none}.chip.busy{color:#ffb84d;border-color:#6b4a00;background:#2a1d00}
+#shareDlg{max-width:min(92vw,820px)}#shareDlg img{display:block;width:100%;border-radius:10px;border:1px solid #2f4a10;margin:10px 0 14px}.dacts{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+.trip .btn{margin-top:14px}
 .big{font-size:30px;font-weight:700;color:var(--g);font-variant-numeric:tabular-nums}.med{font-size:24px;font-weight:700;color:var(--g);font-variant-numeric:tabular-nums}.lbl{color:#9aa3b5;font-size:13px}
 .now{transition:opacity .4s,transform .4s}.now.off{opacity:.45;transform:scale(.99)}
 .pulse{position:absolute;inset:0;border-radius:14px;pointer-events:none}.pulse.go{animation:pz .9s ease-out}
@@ -488,12 +581,14 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 .tiny{background:none;border:none;color:#3f4757;font-size:11px;cursor:pointer}
 @media (max-width:900px){.r3{grid-template-columns:1fr}}
 @media (max-width:900px){.r1,.r2,.two{grid-template-columns:1fr}}
+.seg{max-width:100%;overflow-x:auto}.seg button{white-space:nowrap}
+@media (max-width:600px){body{padding:16px}.top{flex-wrap:wrap;gap:12px}h1{font-size:24px}.seg{display:flex}.seg button{flex:1;padding:7px 4px;font-size:12px}.rts{margin-left:0}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
-<div class=top><div class=brand><picture><source srcset="static/icon-128.png" media="(prefers-reduced-motion: reduce)"><img src="static/icon.webp" width=64 height=64 alt="Furious GPU chip devouring tokens"></picture><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Download a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
-<div class=fbar><div class=seg id=seg><button data-d=7>7 days</button><button data-d=30>30 days</button><button data-d=60>60 days</button><button data-d=90>90 days</button><button data-d=0>All time</button></div><span class=muted id=segSub></span></div>
+<div class=top><div class=brand><picture><source srcset="static/icon-128.png" media="(prefers-reduced-motion: reduce)"><img src="static/icon.webp" width=64 height=64 alt="Furious GPU chip devouring tokens"></picture><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Preview a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
+<div class=fbar><div class=seg id=seg><button data-d=1>24 hours</button><button data-d=7>7 days</button><button data-d=30>30 days</button><button data-d=60>60 days</button><button data-d=90>90 days</button><button data-d=0>All time</button></div><span class=muted id=segSub></span><div class=rts id=rts></div></div>
 <div class="row r1">
- <div class=card id=odoCard><h2>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
+ <div class=card id=odoCard><h2>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=words id=odoWords></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
   <div class=lbl id=rngLbl style="margin-top:14px;color:#9fd14a"></div><div class=grid style="margin-top:6px"><div><div class=lbl>Prompts devoured (input)</div><div class=med id=tin></div></div><div><div class=lbl>Vocabulary purged (output)</div><div class=med id=tout></div></div><div><div class=lbl>Lineages erased (requests)</div><div class=med id=nreq></div></div><div><div class=lbl>Avg extermination speed</div><div class=med id=avg></div></div></div></div>
  <div class=card><h2>Rate of extermination, right now</h2><svg viewBox="0 0 200 120" width=100%><path d="M20 105 A80 80 0 0 1 180 105" stroke="#232833" stroke-width=14 fill=none stroke-linecap=round /><path id=arc d="M20 105 A80 80 0 0 1 180 105" stroke="#76B900" stroke-width=14 fill=none stroke-linecap=round pathLength=100 stroke-dasharray="0 100"/><text x=100 y=92 text-anchor=middle font-size=30 font-weight=700 fill="#76B900" id=tps>0.0</text><text x=100 y=112 text-anchor=middle class=ct style="font-size:11px">tokens / sec (live estimate)</text></svg>
   <svg viewBox="0 0 240 40" width=100% height=40 preserveAspectRatio=none><polyline id=spk fill=none stroke="#76B900" stroke-width=1.5 points=""/></svg><div class=muted>last 60 seconds of mayhem</div></div>
@@ -505,16 +600,17 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
  <div class=card><h2>Year of mass extinction events</h2><svg id=cal width=100%></svg><div class=legend>Mild <span id=leg></span> Apocalyptic</div></div>
 </div>
 <div class="row r3">
- <div class="card trip"><h2>Trip meter</h2><div class=muted id=tripSince></div>
-  <div class=grid style="margin-top:10px;grid-template-columns:1fr 1fr"><div><div class=lbl>Tokens this trip</div><div class=med id=tripTok></div></div><div><div class=lbl>Requests</div><div class=med id=tripReq></div></div><div><div class=lbl>Saved this trip</div><div class=med id=tripSav></div></div><div style="align-self:end"><button class="btn red" id=tripBtn>↺ Reset trip</button></div></div>
-  <div class=muted style="margin-top:8px">Like a car's trip meter: the all-time odometer never resets and nothing is deleted.</div>
-  <h2 style="margin-top:14px">Glovebox (past trips)</h2><div class=th id=tripHist></div></div>
- <div class=card><h2>Model leaderboard: apex predators <span id=lbRng style="text-transform:none;letter-spacing:0;color:#9fd14a"></span></h2><div class=chips id=srcs></div><table id=modT></table></div>
+ <div class="card trip"><h2>Current killing spree</h2><div class=muted id=tripSince></div>
+  <div class=grid style="margin-top:10px;grid-template-columns:1fr 1fr"><div><div class=lbl>Tokens slain this spree</div><div class=med id=tripTok></div></div><div><div class=lbl>Victims (requests)</div><div class=med id=tripReq></div></div><div><div class=lbl>Saved this spree</div><div class=med id=tripSav></div></div><div><div class=lbl>Avg slaughter speed</div><div class=med id=tripAvg></div></div></div>
+  <button class="btn red" id=tripBtn>☠ End this spree</button>
+  <h2 style="margin-top:16px">The mass graves (past sprees)</h2><div class=th id=tripHist></div></div>
+ <div class=card><h2>Model leaderboard: apex predators <span id=lbRng style="text-transform:none;letter-spacing:0;color:#9fd14a"></span></h2><div class=chips id=srcs></div><div class=scroll><table id=modT></table></div></div>
 </div>
 <h3>Trophy case: hall of total eradication (all time) <span id=recN style="color:#9fd14a;text-transform:none;letter-spacing:0"></span></h3><div class=recs id=recs></div>
 <h3>Extinction events survived</h3><div class=chips id=msList></div>
-<div><h3>Daily obliteration ledger <span id=logRng style="text-transform:none;letter-spacing:0;color:#9fd14a"></span></h3><table id=daysT></table></div>
-<dialog id=tripDlg><form method=dialog><b style="color:var(--g)">Reset the trip meter?</b><div class=muted style="margin-top:6px">The current trip goes into the glovebox. All-time totals stay untouched.</div><input id=tripName maxlength=60 placeholder="Name this trip (optional), e.g. Fine-tune round 2"><div style="display:flex;gap:10px;justify-content:flex-end"><button class=btn value=cancel>Never mind</button><button class="btn red" value=ok>Reset it</button></div></form></dialog>
+<div><h3>Daily obliteration ledger <span id=logRng style="text-transform:none;letter-spacing:0;color:#9fd14a"></span></h3><div class=scroll id=ledger><table id=daysT></table></div></div>
+<dialog id=tripDlg><form method=dialog><b style="color:var(--g)">End this killing spree?</b><div class=muted style="margin-top:6px">The current spree gets buried in the mass graves and a fresh one begins. All-time totals stay untouched.</div><input id=tripName maxlength=60 placeholder="Name this spree (optional), e.g. Fine-tune round 2"><div style="display:flex;gap:10px;justify-content:flex-end"><button class=btn value=cancel>Never mind</button><button class="btn red" value=ok>Bury it</button></div></form></dialog>
+<dialog id=shareDlg><b style="color:var(--g)">Your carnage, ready to share</b><img id=shareImg alt="Share card: tokens obliterated, cloud invoices eradicated and trophies"><div class=dacts><button class=btn id=shareNative hidden>📤 Share</button><button class=btn id=shareCopy hidden>📋 Copy image</button><button class=btn id=shareDl>⬇ Download PNG</button><button class=btn id=shareX>Close</button></div><div class=muted id=shareMsg style="margin-top:8px;text-align:right"></div></dialog>
 <div class=ms id=ms hidden><video class=msvid id=msVid muted loop playsinline preload=none poster="static/icon-180.png"><source src="static/splash.mp4" type="video/mp4"></video><div class=msshade></div><canvas id=conf></canvas><div id=orbs></div><div class=msbox><img src="static/icon.webp" class=msg alt=""><div class=mskick id=msKick></div><div class=msbig id=msBig></div><div class=mssub id=msSub></div><button class=btn id=msX>Bask in glory (dismiss)</button></div></div>
 <p class=muted>No GPUs were harmed. Entire bloodlines of cloud invoices were. <button class=tiny id=msTest title="Preview the 1 billion celebration (does not count)">🎉 test the party</button></p>
 <div id=tip></div>
@@ -524,10 +620,22 @@ const $=id=>document.getElementById(id),fmt=n=>Math.round(n||0).toLocaleString('
 const IDLE=["The GPU is napping. Somewhere, a cloud invoice sleeps uneasily.","Idle. Sharpening the tensor cores.","No tokens in sight. The silence is deafening (and free).","Waiting for prey. Feed me a prompt on port "+D.port+".","Plotting the next mass extinction event.","Resting between purges. The vocabulary trembles.","Dormant. Ancient token lineages enjoy a brief reprieve."];
 let tin=D.tin,tout=D.tout,nreq=D.nreq,evOut=D.ev_out,evS=D.ev_s,est=0,streams=[],idleI=0;
 $('sub').textContent="Every token erased here is a token the cloud will never bill you for. Total eradication, locally sourced.";
-// odometer
-const DIG=Math.max(9,String(tin+tout).length+1);$('odo').innerHTML=Array.from({length:DIG},(_,i)=>(i&&(DIG-i)%3==0?'<span class=sep>,</span>':'')+'<div class=dig><div>'+[...'0123456789'].map(d=>'<span>'+d+'</span>').join('')+'</div></div>').join('');
-const reels=[...document.querySelectorAll('.dig>div')];
-function setOdo(n){const s=String(Math.floor(n)).padStart(DIG,'0').slice(-DIG);reels.forEach((r,i)=>r.style.transform=`translateY(${-58*s[i]}px)`)}
+// odometer: grows a reel whenever the count gains a digit (always one spare zero up front), shrinks the reels to fit
+// the card, and once even 18px reels won't fit it rolls in thousands/millions/... with a unit badge.
+const ODO=$('odo'),UNITS=['','THOUSAND','MILLION','BILLION','TRILLION','QUADRILLION'];let DIG=0,SC=0,DH=58,reels=[],odoN=0;
+const odoW=(dig,dw)=>dig*(dw+5)+Math.floor((dig-1)/3)*(dw/3+3);   // reel width + border + gap, plus the comma columns
+const odoDw=(dig,avail)=>(avail-odoW(dig,0))/(odoW(dig,1)-odoW(dig,0));   // widest reel that fits
+function odoBuild(dig,sc){DIG=dig;SC=sc;ODO.innerHTML=Array.from({length:dig},(_,i)=>(i&&(dig-i)%3==0?'<span class=sep>,</span>':'')+'<div class=dig><div>'+[...'0123456789'].map(d=>'<span>'+d+'</span>').join('')+'</div></div>').join('')+(sc?`<span class=unit>${UNITS[sc]}</span>`:'');reels=[...ODO.querySelectorAll('.dig>div')]}
+function odoFit(n){const avail=ODO.parentElement.clientWidth-30||560;let sc=0,dig;
+ for(;;sc++){dig=Math.max(9-3*sc,String(Math.floor(n/1e3**sc)).length+1);if(odoW(dig,18)+(sc?110:0)<=avail||sc>=UNITS.length-1)break}
+ const dw=Math.max(18,Math.min(36,Math.floor(odoDw(dig,avail-(sc?110:0)))));DH=Math.round(dw*1.6);ODO.style.setProperty('--dw',dw+'px');ODO.style.setProperty('--dh',DH+'px');
+ if(dig!=DIG||sc!=SC)odoBuild(dig,sc)}
+const WORD=[[1e15,'quadrillion'],[1e12,'trillion'],[1e9,'billion'],[1e6,'million'],[1e3,'thousand']];
+function words(n){for(const [v,w] of WORD)if(n>=v)return '≈ '+(n/v).toLocaleString('en-US',{maximumFractionDigits:n/v<10?2:1})+' '+w+' tokens';return ''}
+function setOdo(n){n=Math.floor(n);odoN=n;if(String(Math.floor(n/1e3**SC)).length+1>DIG||!DIG)odoFit(n);
+ const s=String(Math.floor(n/1e3**SC)).padStart(DIG,'0').slice(-DIG);reels.forEach((r,i)=>r.style.transform=`translateY(${-DH*s[i]}px)`);
+ $('odoWords').textContent=words(n);ODO.title=fmt(n)+' tokens'}
+if(window.ResizeObserver)new ResizeObserver(()=>{if(DIG){odoFit(odoN);setOdo(odoN)}}).observe($('odoCard'));
 // calendar
 const shades=["#1b1f27","#2a4d0a","#3f7a00","#5a9e00","#76B900"];$('leg').innerHTML=shades.map(s=>`<span class=sw style="background:${s}"></span>`).join('');
 const per={};D.days.forEach(([d,a,b])=>per[d]=a+b);
@@ -543,13 +651,13 @@ function paint(){rects.forEach(r=>{const x=days[r.dataset.i];r.setAttribute('fil
 const tip=$('tip');rects.forEach(r=>{r.onmousemove=e=>{const x=days[r.dataset.i];tip.textContent=x.d.toDateString()+': '+fmt(x.t)+' tokens annihilated';tip.style.display='block';tip.style.left=e.clientX+12+'px';tip.style.top=e.clientY+12+'px'};r.onmouseleave=()=>tip.style.display='none'});
 paint();
 // tables
-function tables(){const DD=cutoff?D.days.filter(x=>x[0]>=cutoff):D.days.slice(0,30),dm=Math.max(1,...DD.map(([,a,b])=>a+b));
+function tables(){const DD=cutoff?D.days.filter(x=>x[0]>=cutoff):D.days,dm=Math.max(1,...DD.map(([,a,b])=>a+b));
  $('daysT').innerHTML='<tr class=muted><td>Day</td><td></td><td>In</td><td>Out</td></tr>'+(DD.map(([d,a,b])=>`<tr><td>${d}</td><td class=bar><div style="width:${(100*(a+b)/dm).toFixed(1)}%"></div></td><td>${fmt(a)}</td><td>${fmt(b)}</td></tr>`).join('')||`<tr><td colspan=4 class=muted>The silence before the storm. Nothing in this window. Point a client at the proxy and let the purge begin.</td></tr>`);
 }
 tables();
 const priced=D.prices.filter(p=>p.input_per_mtok!=null&&p.output_per_mtok!=null),hero=priced[0];
 $('savSub').textContent=hero?`kept out of ${hero.label}'s pockets ($${hero.input_per_mtok} / $${hero.output_per_mtok} per M)`:'no prices in prices.json';
-const cost=(p,i,o)=>i/1e6*p.input_per_mtok+o/1e6*p.output_per_mtok,money=x=>'$'+x.toFixed(x<100?4:2);
+const cost=(p,i,o)=>i/1e6*p.input_per_mtok+o/1e6*p.output_per_mtok,money=x=>'$'+(x<100?x.toFixed(4):x.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}));
 
 // ===== leaderboard, records, trips, milestones, share card =====
 let ST=D.st;
@@ -562,14 +670,17 @@ function renderLB(){const L=ST.leaderboard,md=['🥇','🥈','🥉'],mx=Math.max
 function renderRec(){const R=ST.records,got=R.filter(r=>r.value!=null).length;$('recN').textContent=`(${got} of ${R.length} trophies unlocked)`;
  $('recs').innerHTML=R.map(r=>r.value==null?`<div class="rec locked"><div class=ri>🔒</div><div class=rt>${esc(r.title)}</div><div class=rv>???</div><div class=rd>${esc(r.hint||'')}</div></div>`:`<div class=rec><div class=ri>${r.icon}</div><div class=rt>${esc(r.title)}</div><div class=rv>${esc(r.value)}</div><div class=rd>${esc(r.detail||'')}</div><div class=rw>🏆 ${esc(r.ts?when(r.ts):(r.date||''))}</div></div>`).join('')}
 function renderTrip(){const t=ST.trip;if(!t)return;$('tripTok').textContent=fmt(t.tin+t.tout);$('tripReq').textContent=fmt(t.n);$('tripSav').textContent=hero?money(cost(hero,t.tin,t.tout)):'–';
- $('tripSince').textContent='Since '+when(t.start_ts)+' ('+ago(t.start_ts)+')';
- $('tripHist').innerHTML=ST.trips.map(p=>`<div><span>${esc(p.name||'Unnamed trip')}<span class=muted> · ${new Date(p.start_ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})} to ${new Date(p.end_ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})}</span></span><b style="color:var(--g)">${fmt(p.tin+p.tout)} tok${hero?' · '+money(p.usd):''}</b></div>`).join('')||'<div class=muted>Empty. Reset a trip to stash it here.</div>'}
+ $('tripAvg').textContent=t.ev_s>0?(t.ev_out/t.ev_s).toFixed(1)+' tok/s':'–';
+ $('tripSince').textContent='Rampaging since '+when(t.start_ts)+' ('+ago(t.start_ts)+')';
+ $('tripHist').innerHTML=ST.trips.map(p=>`<div><span>${esc(p.name||'Unnamed spree')}<span class=muted> · ${new Date(p.start_ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})} to ${new Date(p.end_ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})}</span></span><b style="color:var(--g)">${fmt(p.tin+p.tout)} tok${hero?' · '+money(p.usd):''}</b></div>`).join('')||'<div class=muted>Empty. End a spree to bury it here.</div>'}
+function renderRt(){$('rts').innerHTML=(ST.runtimes||[]).filter(r=>r.ok||r.used&&(r.error||r.ok===false)).map(r=>r.error?`<span class="chip busy" title="${esc(r.error)}">⚠ ${esc(r.label)}: ${esc(r.error)}</span>`
+  :`<span class="chip${r.ok?'':' down'}" title="clients use :${r.listen}, forwarded to ${esc(r.up)}">${r.ok?'●':'○'} ${esc(r.label)} :${r.listen}${r.ok?'':' (nobody home)'}</span>`).join('')}
 const bigNum=v=>v>=1e9?+(v/1e9).toFixed(1)+' BILLION':v>=1e6?+(v/1e6).toFixed(1)+' MILLION':fmt(v);
 function msName(m){return m.kind=='usd'?'$'+fmt(m.value)+' saved':bigNum(m.value).toLowerCase()+' tokens'}
 function renderMs(){$('msList').innerHTML=ST.milestones.map(m=>`<span class=chip title="${esc(when(m.reached_ts))}">${m.kind=='usd'?'💰':m.value>=1e9?'🌋':'🎉'} ${esc(msName(m))}</span>`).join('')||'<span class="chip soon">None yet. First stop: 1 million tokens. Then $100 saved.</span>'}
 function nextMilestone(){const tok=tin+tout,sv=hero?cost(hero,tin,tout):0;const nt=tok<1e6?1e6:tok<1e7?1e7:(Math.floor(tok/1e8)+1)*1e8,ns=(Math.floor(sv/100)+1)*100;
  $('nextMs').textContent=`Next party: ${bigNum(nt).toLowerCase()} tokens (${fmt(nt-tok)} to go)`+(hero?` · $${fmt(ns)} saved ($${(ns-sv).toFixed(2)} to go)`:'')}
-function renderAll(){renderLB();renderRec();renderTrip();renderMs();nextMilestone()}
+function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();nextMilestone()}
 let rT=null,lastR=0;function refreshSoon(){if(rT)return;rT=setTimeout(()=>{rT=null;lastR=Date.now();refreshNow()},Math.max(3000,10000-(Date.now()-lastR)))}
 // trip reset
 $('tripBtn').onclick=()=>{$('tripName').value='';$('tripDlg').showModal()};
@@ -605,20 +716,30 @@ $('share').onclick=async()=>{const W=1200,H=630,cv=document.createElement('canva
  x.strokeStyle=G;x.lineWidth=6;x.strokeRect(16,16,W-32,H-32);
  const img=new Image();img.src='static/icon-180.png';try{await img.decode();x.drawImage(img,52,44,120,120)}catch(_){}
  x.fillStyle=G;x.font='800 46px '+SF;x.fillText('DGX Token Annihilator',196,98);x.fillStyle='#9aa3b5';x.font='24px '+SF;x.fillText('Local mass extinction report · '+new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}),196,138);
- x.font='600 20px '+SF;x.fillText('TOKENS OBLITERATED',56,228);x.fillStyle=G;x.font='800 84px ui-monospace,Menlo,monospace';x.fillText(fmt(tin+tout),56,310);
+ x.font='600 20px '+SF;x.fillText('TOKENS OBLITERATED',56,228);x.fillStyle=G;let fs=84;do x.font=`800 ${fs}px ui-monospace,Menlo,monospace`;while(x.measureText(fmt(tin+tout)).width>600&&(fs-=4)>30);x.fillText(fmt(tin+tout),56,310);
  x.fillStyle='#9aa3b5';x.font='600 20px '+SF;x.fillText(fitText(x,'CLOUD INVOICES ERADICATED'+(hero?' (vs '+hero.label.toUpperCase()+')':''),600),56,370);x.fillStyle='#fff';x.font='800 54px '+SF;x.fillText(hero?money(cost(hero,tin,tout)):'–',56,428);
  const L=ST.leaderboard[0];x.fillStyle='#c9ced8';x.font='22px '+SF;
  [['Lineages erased',fmt(nreq)],['Avg speed',evS>0?(evOut/evS).toFixed(1)+' tok/s':'–'],['Top model',L?L.model:'–']].forEach(([a,b],i)=>{x.fillStyle='#9aa3b5';x.fillText(a,56,488+i*36);x.fillStyle=G;x.font='700 22px '+SF;x.fillText(fitText(x,b,330),300,488+i*36);x.font='22px '+SF});
  x.fillStyle='#9aa3b5';x.font='600 20px '+SF;x.fillText('TROPHY CASE',700,228);
  ST.records.filter(r=>r.value!=null).slice(0,6).forEach((r,i)=>{const y=270+i*52;x.font='26px '+SF;x.fillText(r.icon,700,y);x.fillStyle='#9aa3b5';x.font='16px '+SF;x.fillText(r.title.toUpperCase(),745,y-8);x.fillStyle=G;x.font='700 22px '+SF;x.fillText(fitText(x,r.value,380),745,y+16);x.fillStyle='#9aa3b5'});
  x.fillStyle='#6b7285';x.font='italic 18px '+SF;x.fillText('No GPUs were harmed. Entire bloodlines of cloud invoices were.',56,H-40);
- cv.toBlob(b=>{const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='token-carnage-'+D.today+'.png';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),5000)},'image/png')};
+ cv.toBlob(showShare,'image/png')};
+// share preview: look first, then download / copy / native share (copy + share need https or localhost)
+let shareBlob=null,shareUrl='';const shareName=()=>'token-carnage-'+D.today+'.png';
+function showShare(b){shareBlob=b;if(shareUrl)URL.revokeObjectURL(shareUrl);shareUrl=URL.createObjectURL(b);$('shareImg').src=shareUrl;$('shareMsg').textContent='';
+ const file=new File([b],shareName(),{type:'image/png'});
+ $('shareNative').hidden=!(navigator.canShare&&navigator.canShare({files:[file]}));$('shareCopy').hidden=!(navigator.clipboard&&window.ClipboardItem);
+ $('shareDlg').showModal()}
+$('shareDl').onclick=()=>{const a=document.createElement('a');a.href=shareUrl;a.download=shareName();document.body.appendChild(a);a.click();a.remove()};
+$('shareCopy').onclick=async()=>{try{await navigator.clipboard.write([new ClipboardItem({'image/png':shareBlob})]);$('shareMsg').textContent='Copied. Paste it somewhere the cloud can see it.'}catch(_){$('shareMsg').textContent='The clipboard refused. Download it instead.'}};
+$('shareNative').onclick=async()=>{try{await navigator.share({files:[new File([shareBlob],shareName(),{type:'image/png'})],title:'Token carnage report'})}catch(_){}};
+$('shareX').onclick=()=>$('shareDlg').close();$('shareDlg').onclick=e=>{if(e.target==$('shareDlg'))$('shareDlg').close()};
 // ===== time filter (7/30/60/90/all). Odometer + trophies stay all-time. =====
 let RG=ST.rng,rDays=+(localStorage.getItem('tad.range')||0);
-const RNAME=d=>d?'last '+d+' days':'all time';
+const RNAME=d=>d==1?'last 24 hours':d?'last '+d+' days':'all time';
 function setRange(d,fetchIt){rDays=d;localStorage.setItem('tad.range',d);
  document.querySelectorAll('#seg button').forEach(b=>b.classList.toggle('on',+b.dataset.d==d));
- if(d){const c=new Date(today);c.setDate(c.getDate()-d+1);cutoff=iso(c)}else cutoff='';
+ if(d){const c=new Date(today);c.setDate(c.getDate()-(d==1?1:d-1));cutoff=iso(c)}else cutoff='';   // rolling 24h touches yesterday too
  $('rngLbl').textContent='In the '+RNAME(d)+':';['savRng','lbRng','logRng'].forEach(i=>$(i).textContent='('+RNAME(d)+')');
  $('segSub').textContent=d?'Showing the '+RNAME(d)+'. The odometer and trophies never forget.':'Showing everything since the first drop of blood.';
  paint();tables();draw();if(fetchIt)refreshNow()}
@@ -630,14 +751,14 @@ let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0;
 function onMsg(m){streams=m.streams||[];
  for(const f of (m.done||[])){tin+=f.in;tout+=f.out;nreq++;if(f.eval_s&&f.out){evOut+=f.out;evS+=f.eval_s;RG.ev_out+=f.out;RG.ev_s+=f.eval_s}RG.tin+=f.in;RG.tout+=f.out;RG.nreq++;T.t+=f.in+f.out;
   const dd=D.days.find(x=>x[0]==D.today);if(dd){dd[1]+=f.in;dd[2]+=f.out}else D.days.unshift([D.today,f.in,f.out]);
-  if(ST.trip){ST.trip.tin+=f.in;ST.trip.tout+=f.out;ST.trip.n++}
+  if(ST.trip){ST.trip.tin+=f.in;ST.trip.tout+=f.out;ST.trip.n++;if(f.eval_s&&f.out){ST.trip.ev_out+=f.out;ST.trip.ev_s+=f.eval_s}}
   for(const k of (f.ms||[]))celebrate(k);
   showDone(f)}
  if(m.done&&m.done.length){tables();renderTrip();nextMilestone();refreshSoon();if(T.t>mx){mx=T.t;paint()}}
  const e=streams.reduce((a,s)=>a+s.out_est,0);secOut+=Math.max(0,e-prevEst);prevEst=streams.length?e:0;est=e;
- if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').textContent=s.model||'?';$('ni').textContent='counting...';$('no').textContent='~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
+ if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent='~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
  draw()}
-function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').textContent=f.model||'?';$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
+function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
  if(!matchMedia('(prefers-reduced-motion: reduce)').matches&&!document.hidden){const c=$('now'),p=$('pulse');p.classList.remove('go');void p.offsetWidth;p.classList.add('go');for(let i=0;i<14;i++){const s=document.createElement('i');s.className='spark';const a=i/14*6.28;s.style.left='85%';s.style.top='50%';s.style.setProperty('--dx',Math.cos(a)*60+'px');s.style.setProperty('--dy',Math.sin(a)*40+'px');c.appendChild(s);setTimeout(()=>s.remove(),850)}}}
 function draw(){const live=streams.length>0,total=tin+tout+est;setOdo(total);
  $('odoSub').textContent=live?`including ~${fmt(est)} in flight (estimate until the stream finishes)`:'exact counts, straight from your inference backends';
@@ -656,6 +777,7 @@ function frame(t){if(!running)return;const dt=Math.min(.2,(t-last)/1000);last=t;
  requestAnimationFrame(frame)}
 document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();requestAnimationFrame(frame)}});
 setInterval(()=>{if(!streams.length&&!document.hidden)$('idle').textContent=IDLE[idleI++%IDLE.length]},20000);
+setInterval(()=>{if(!document.hidden)refreshNow()},60000);   // keeps runtime chips and "last seen" honest when idle
 // SSE with 60s full-refresh fallback
 let fb=null;function connect(){const es=new EventSource('events');
  es.onopen=()=>{$('conn').textContent='Live: extinction feed connected';$('conn').classList.remove('off');if(fb){clearTimeout(fb);fb=null}};
@@ -765,13 +887,13 @@ if __name__ == "__main__":
         llama_backfill(); sys.exit()
     if LLAMA_LOG:
         threading.Thread(target=llama_loop, daemon=True).start(); print("tailing llama.cpp log", LLAMA_LOG, flush=True)
-    for spec in filter(None, (x.strip() for x in OPENAI_PROXIES.split(","))):
+    for spec in filter(None, (x.strip() for x in proxy_specs().split(","))):
         src, _, rest = spec.partition(":"); lp, _, upstream = rest.partition("="); uh, _, upp = upstream.rpartition(":")
         H = type("Proxy_" + src, (Proxy,), {"UPH": uh or "127.0.0.1", "UPP": int(upp), "SRC": src})
-        threading.Thread(target=TS((PROXY_BIND, int(lp)), H).serve_forever, daemon=True).start()
-        print(f"{SOURCE_LABELS.get(src, src)} proxy {PROXY_BIND}:{lp} -> {H.UPH}:{H.UPP}", flush=True)
+        start_proxy(H, src, int(lp), (H.UPH, H.UPP))
     print(f"dashboard http://{DASH_BIND}:{DASH_PORT}", flush=True)
     if OLLAMA_PROXY:
-        threading.Thread(target=TS((PROXY_BIND, PROXY_PORT), Proxy).serve_forever, daemon=True).start()
-        print(f"Ollama proxy {PROXY_BIND}:{PROXY_PORT} -> {UP_HOST}:{UP_PORT}", flush=True)
+        if PROXY_SOURCE: Proxy.SRC = "proxy" if PROXY_SOURCE == "ollama" else PROXY_SOURCE
+        start_proxy(Proxy, Proxy.SRC, PROXY_PORT, (UP_HOST, UP_PORT))
+    threading.Thread(target=runtimes_loop, daemon=True).start()
     TS((DASH_BIND, DASH_PORT), Dash).serve_forever()

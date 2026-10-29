@@ -15,20 +15,26 @@ Backends supported, each with its own source label:
 | **Ollama** | Transparent proxy (default `:11435` -> `:11434`) | Ollama |
 | **vLLM** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | vLLM |
 | **llama.cpp** (`llama-server`) | Read-only tail of the server log (`LLAMA_LOG`) and/or the OpenAI-compatible proxy | llama.cpp |
+| **NVIDIA NIM / NeMo, TensorRT-LLM, Triton (OpenAI front end), SGLang, LM Studio** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | NVIDIA NIM, NeMo, TensorRT-LLM, ... |
+| **ONNX Runtime** (Foundry Local, onnxruntime-genai OpenAI servers) | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | ONNX Runtime |
+
+Anything that speaks `/v1/chat/completions`, `/v1/completions`, `/v1/responses` or `/v1/embeddings` and returns a `usage` field is counted exactly. Run as many runtimes at once as you like; each one gets its own label, leaderboard chip and status chip.
 
 **Your inference servers are never modified.** The proxies just forward requests and read the token counts on the way back, and the llama.cpp log tail never connects to the server at all. Everything fails open: if logging breaks, your request still succeeds. If the dashboard dies, point your client back at the real port and carry on.
 
 ## Features
 
 - **Live odometer** of tokens obliterated (all time, never resets), live tokens/sec gauge and "Now annihilating" card over Server-Sent Events (throttled to ~4 updates/s, ~0.2% CPU idle).
-- **Time filter**: 7 days / 30 days / 60 days / 90 days / All time. Filters the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. The odometer and trophies always stay all-time.
+- **Time filter**: 24 hours (rolling) / 7 days / 30 days / 60 days / 90 days / All time. Filters the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. The odometer and trophies always stay all-time.
 - **Model leaderboard** (apex predators) with per-source chips: tokens, requests, average and best tok/s, biggest single output.
 - **Trophy case**: 27 personal records (Speed Demon, Night Owl, Week of Wrath, Iron Streak, Reigning Champion...).
 - **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy: 1M and 10M tokens, every 100M, a much bigger Total Eradication show at every 1B, and every $100 saved. "🎉 test the party" in the footer previews it.
-- **Trip meter** with a reset button and a "Glovebox" of past trips. Nothing is ever deleted.
-- **📸 Share card**: one click downloads a 1200x630 PNG of your carnage.
+- **Current killing spree**: tokens, victims (requests), savings and average speed since you last ended a spree. Past sprees rest in "The mass graves". Nothing is ever deleted.
+- **📸 Share card**: previews a 1200x630 PNG of your carnage, then download it, copy it, or use your phone's share sheet (copy and share need https or localhost).
+- **Runtime status chips** next to the time filter: which proxies are up, and a warning when a runtime you have used stops answering.
+- **Odometer that keeps up**: adds a reel whenever the count gains a digit, shrinks the reels to fit the card (phones too), shows a plain-English caption ("≈ 50.8 million tokens"), and on very narrow screens rolls in millions/billions with a unit badge.
 - **GitHub-style calendar** of tokens per day for the last year, in NVIDIA green.
-- **Cloud invoices eradicated** vs Claude Opus 5.5, Claude Sonnet 5.5, GPT-6.1 Sol, GPT-6.1 Terra and Grok 4.7, from `prices.json` (list prices checked 2026-10-28, sources inside; edit freely).
+- **Cloud invoices eradicated** vs Claude Opus 5.5, Claude Fable 5.1, GPT-6 Astra, Claude Sonnet 5.5, GPT-6.1 Sol, Gemini 3.1 Pro, GPT-6.1 Terra and Grok 4.7, from `prices.json` (list prices checked 2026-10-28, sources inside; edit freely).
 
 ## Install
 
@@ -64,13 +70,13 @@ OpenAI-style clients: base URL `http://127.0.0.1:11435/v1`. Not using Ollama? Se
 
 ### vLLM
 
-Start vLLM as usual (say on port 8000) and add a counting proxy in front of it:
+On by default: a counting proxy on **8001** forwards to vLLM on 8000. Point your clients at `http://127.0.0.1:8001/v1`. Different ports or host (say vLLM runs across two Sparks with the API on the head node):
 
 ```bash
-OPENAI_PROXIES="vllm:8001=127.0.0.1:8000" python3 token_annihilator.py
+OPENAI_PROXIES="vllm:8001=spark-1:8000" python3 token_annihilator.py
 ```
 
-Then point your clients at `http://127.0.0.1:8001/v1`. The proxy reads the `usage` field from every response. For streaming requests it automatically adds `"stream_options": {"include_usage": true}` (only when the client did not set `stream_options` itself) so the final chunk carries the token counts. Disable that with `INJECT_USAGE=0`.
+The proxy reads the `usage` field from every response. For streaming requests it automatically adds `"stream_options": {"include_usage": true}` (only when the client did not set `stream_options` itself) so the final chunk carries the token counts. Disable that with `INJECT_USAGE=0`. vLLM reports no timings, so for streamed requests the speed (tok/s) is measured from the first to the last streamed chunk.
 
 ### llama.cpp
 
@@ -85,9 +91,25 @@ Two options, use either or both:
 
    The file is polled every `LLAMA_POLL_S` seconds (default 15), and the model name comes from the GGUF file name. To import a log that already exists, run `python3 token_annihilator.py --llama-backfill` once.
 
-2. **Counting proxy**, same as vLLM: `OPENAI_PROXIES="llamacpp:8081=127.0.0.1:8080"`, then use port 8081.
+2. **Counting proxy**, on by default on **8081** -> 8080 (switched off automatically when `LLAMA_LOG` is set), then use port 8081.
 
-Don't count the same server both ways at once, or its tokens are counted twice. Several proxies can be combined: `OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080"`.
+Don't count the same server both ways at once, or its tokens are counted twice.
+
+### NVIDIA NIM / NeMo, ONNX Runtime and other OpenAI-compatible servers
+
+Give each one a name and a port in `OPENAI_PROXIES`. Known names get a pretty label (`nim`, `nemo`, `trtllm`, `triton`, `onnx`, `sglang`, `lmstudio`, `openai`); any other name is shown as written.
+
+```bash
+OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,nim:8002=127.0.0.1:9000,onnx:8003=127.0.0.1:5273" python3 token_annihilator.py
+```
+
+Raw Triton KServe (`/v2/models/.../generate`) and in-process ONNX Runtime return no token counts, so they can't be counted. Put Triton's OpenAI front end or an OpenAI-compatible ONNX server in front.
+
+### Several runtimes at once
+
+Ollama (11435), vLLM (8001) and llama.cpp (8081) proxies all start by default, so running a big vLLM model and a small Ollama model side by side needs no config. Setting `OPENAI_PROXIES` replaces the vLLM/llama.cpp defaults with exactly what you list. The 11435 proxy labels itself by whatever actually answers upstream (if you point `UPSTREAM_PORT` at vLLM it says vLLM, not Ollama); force it with `PROXY_SOURCE`.
+
+Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAMACPP_*` settings still work, and rows it saved are relabelled from Ollama to their real runtime the first time this version starts.
 
 ## Configuration
 
@@ -97,7 +119,9 @@ Don't count the same server both ways at once, or its tokens are counted twice. 
 | `PROXY_BIND` / `PROXY_PORT` | `0.0.0.0` / `11435` | Ollama proxy listen address |
 | `UPSTREAM_HOST` / `UPSTREAM_PORT` | `127.0.0.1` / `11434` | Where Ollama lives |
 | `OLLAMA_PROXY` | `1` | `0` disables the Ollama proxy |
-| `OPENAI_PROXIES` | empty | `source:listen_port=upstream_host:port`, comma-separated |
+| `OPENAI_PROXIES` | `vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080` | `source:listen_port=upstream_host:port`, comma-separated. Set empty for none |
+| `PROXY_SOURCE` | detected | Force the label of the 11435 proxy (`ollama`, `vllm`, ...) |
+| `ENGINES` | `ollama,vllm,llamacpp` | Older-build switch; used only when `OPENAI_PROXIES` is unset |
 | `INJECT_USAGE` | `1` | Ask streaming `/v1` requests to include usage |
 | `LLAMA_LOG` | empty (off) | llama-server log file to tail |
 | `LLAMA_POLL_S` | `15` | Log poll interval, seconds |

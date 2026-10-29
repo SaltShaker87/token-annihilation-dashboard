@@ -34,6 +34,13 @@ class ParseTests(unittest.TestCase):
         body = '{"model":"e","data":[{"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":6,"total_tokens":6}}'
         self.assertEqual(parse(body), ("e", 6, 0, None))   # our version records 0 output tokens
 
+    def test_responses_api_usage(self):
+        self.assertEqual(parse('{"model":"r","usage":{"input_tokens":9,"output_tokens":11,"total_tokens":20}}'), ("r", 9, 11, None))
+        body = ('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+                'event: response.completed\ndata: {"type":"response.completed","response":{"model":"rs","usage":{"input_tokens":2,"output_tokens":3}}}\n\n')
+        self.assertEqual(parse(body), ("rs", 2, 3, None))
+        self.assertEqual(ta.add_usage_opt("/v1/responses", b'{"stream":true}'), b'{"stream":true}')   # never inject there
+
     def test_request_model_fallback(self):
         self.assertEqual(parse('{"id":"x"}', b'{"model":"asked"}'), ("asked", None, None, None))
 
@@ -64,17 +71,51 @@ class LlamaLogTests(unittest.TestCase):
         finally: ta.DB = old
 
 
+class MigrationTests(unittest.TestCase):
+    def test_older_build_rows_get_their_real_runtime(self):
+        tmp = tempfile.mkdtemp(); old = ta.DB
+        try:
+            ta.DB = os.path.join(tmp, "s.db"); c = ta.db()
+            c.execute("ALTER TABLE requests ADD COLUMN backend TEXT")
+            c.executemany("INSERT INTO requests(ts,model,input_tokens,output_tokens,source,backend) VALUES(?,?,?,?,?,?)",
+                          [(1, "qwen", 1, 2, "proxy", "vllm"), (2, "small", 1, 2, "proxy", "ollama"), (3, "gguf", 1, 2, "proxy", "llamacpp"), (4, None, None, None, "backfill", "ollama")])
+            c.commit(); c.close()
+            ta.init_db(); ta.init_db()   # idempotent
+            rows = sqlite3.connect(ta.DB).execute("SELECT model, source FROM requests ORDER BY ts").fetchall()
+            self.assertEqual(rows, [("qwen", "vllm"), ("small", "proxy"), ("gguf", "llamacpp"), (None, "backfill")])
+        finally: ta.DB = old
+
+    def test_older_build_env_vars_still_start_proxies(self):
+        saved = (ta.OPENAI_PROXIES, ta.ENGINES, ta.LLAMA_LOG, dict(os.environ))
+        try:
+            ta.OPENAI_PROXIES, ta.ENGINES, ta.LLAMA_LOG = None, ["ollama", "vllm", "llamacpp"], ""
+            os.environ.update(VLLM_PROXY_PORT="9001", VLLM_UPSTREAM_PORT="9000")
+            self.assertEqual(ta.proxy_specs(), "vllm:9001=127.0.0.1:9000,llamacpp:8081=127.0.0.1:8080")
+            ta.LLAMA_LOG = "/tmp/x.log"; self.assertEqual(ta.proxy_specs(), "vllm:9001=127.0.0.1:9000")   # log tail counts llama.cpp
+            ta.OPENAI_PROXIES = ""; self.assertEqual(ta.proxy_specs(), "")   # explicitly empty = none
+        finally:
+            ta.OPENAI_PROXIES, ta.ENGINES, ta.LLAMA_LOG = saved[:3]; os.environ.clear(); os.environ.update(saved[3])
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
-    def _reply(self, body):
+    def _reply(self, body, status=200):
         body = body.encode() if isinstance(body, str) else body
-        self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-    def do_GET(self): self._reply('{"status":"ok"}')
+        self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        g = getattr(self.server, "gets", {}).get(self.path)
+        self._reply(g) if g else self._reply('{"error":"nope"}', 404)
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)); self.server.seen.append((self.path, body))
         q = self.server.queue.get(self.path.split("?")[0])
-        self._reply(q.pop(0) if q else '{"ok":true}')
+        item = q.pop(0) if q else '{"ok":true}'
+        if isinstance(item, list):   # a slow token stream, one SSE event at a time
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
+            for part in item:
+                p = part.encode(); self.wfile.write(b"%x\r\n%s\r\n" % (len(p), p)); self.wfile.flush(); time.sleep(0.05)
+            self.wfile.write(b"0\r\n\r\n"); return
+        self._reply(item)
 
 
 class Server(ThreadingMixIn, http.server.HTTPServer): daemon_threads = True; allow_reuse_address = True
@@ -98,12 +139,17 @@ class ProxyTests(unittest.TestCase):
             "vllm": {"/v1/chat/completions": [
                 '{"model":"meta-llama","usage":{"prompt_tokens":5,"completion_tokens":7}}',
                 'data: {"model":"streamy","usage":null}\n\ndata: {"model":"streamy","usage":{"prompt_tokens":3,"completion_tokens":4}}\n\ndata: [DONE]\n',
-                '{"id":"blank"}']},
+                '{"id":"blank"}',
+                ['data: {"model":"slowpoke","choices":[{"delta":{"content":"a"}}]}\n\n'] * 4 +
+                ['data: {"model":"slowpoke","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":5}}\n\n', 'data: [DONE]\n\n']]},
             "llamacpp": {"/v1/chat/completions": ['{"model":"gguf","usage":{"prompt_tokens":8,"completion_tokens":6},"timings":{"predicted_ms":250}}']},
         }
+        gets = {"ollama": {"/api/version": '{"version":"0.12.0"}', "/api/tags": '{"models":[]}'},
+                "vllm": {"/v1/models": '{"object":"list","data":[{"id":"qwen","owned_by":"vllm"}]}'},
+                "llamacpp": {"/v1/models": '{"object":"list","data":[{"id":"gguf","owned_by":"llamacpp"}]}'}}
         cls.servers = {}
         for k, port in cls.up.items():
-            s = Server(("127.0.0.1", port), Handler); s.queue = queues[k]; s.seen = []
+            s = Server(("127.0.0.1", port), Handler); s.queue = queues[k]; s.seen = []; s.gets = gets[k]
             threading.Thread(target=s.serve_forever, daemon=True).start(); cls.servers[k] = s
         env = dict(os.environ, STATS_DB=cls.db, DASH_BIND="127.0.0.1", DASH_PORT=str(cls.dash), PROXY_BIND="127.0.0.1",
                    PROXY_PORT=str(cls.px["ollama"]), UPSTREAM_HOST="127.0.0.1", UPSTREAM_PORT=str(cls.up["ollama"]), LLAMA_LOG="",
@@ -151,6 +197,32 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(j["rng"]["nreq"], 5)
         j7 = json.loads(req(self.dash, "GET", "/api/stats?days=7")[1]); self.assertEqual(j7["rng"]["nreq"], 5)
         junk = json.loads(req(self.dash, "GET", "/api/stats?days=%3Cscript%3E")[1]); self.assertIsNone(junk["rng"]["since"])
+        rts = {r["label"]: r for r in j["runtimes"]}
+        self.assertEqual(set(rts), {"Ollama", "vLLM", "llama.cpp"}); self.assertTrue(all(r["ok"] for r in rts.values()))
+
+    def test_probe_tells_runtimes_apart(self):
+        self.assertEqual(ta.probe("127.0.0.1", self.up["ollama"]), "ollama")
+        self.assertEqual(ta.probe("127.0.0.1", self.up["vllm"]), "vllm")
+        self.assertEqual(ta.probe("127.0.0.1", self.up["llamacpp"]), "llamacpp")
+        self.assertIsNone(ta.probe("127.0.0.1", 1))
+
+    def test_default_proxy_pointed_at_vllm_is_labelled_vllm(self):
+        saved = list(ta.RUNTIMES)
+        try:
+            ta.RUNTIMES[:] = [{"src": "proxy", "listen": 1, "up": ("127.0.0.1", self.up["vllm"]), "cls": ta.Proxy}]
+            ta.check_runtimes(); self.assertEqual(ta.Proxy.SRC, "vllm")
+            ta.RUNTIMES[0]["up"] = ("127.0.0.1", self.up["ollama"])
+            ta.check_runtimes(); self.assertEqual(ta.Proxy.SRC, "proxy")
+        finally: ta.RUNTIMES[:] = saved; ta.Proxy.SRC = "proxy"
+
+    def test_streamed_vllm_gets_speed(self):
+        while self.servers["vllm"].queue["/v1/chat/completions"][:-1]: self.servers["vllm"].queue["/v1/chat/completions"].pop(0)   # if run alone
+        st, body = req(self.px["vllm"], "POST", "/v1/chat/completions", {"model": "slowpoke", "stream": True})
+        self.assertEqual(st, 200); self.assertIn(b"[DONE]", body)
+        deadline = time.time() + 3; r = None
+        while time.time() < deadline and not r:
+            r = sqlite3.connect(self.db).execute("SELECT input_tokens, output_tokens, eval_s FROM requests WHERE model='slowpoke'").fetchone(); time.sleep(0.05)
+        self.assertEqual(r[:2], (2, 5)); self.assertTrue(0.1 < r[2] < 2, r)
 
 
 if __name__ == "__main__":
