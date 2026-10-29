@@ -786,12 +786,14 @@ function draw(){const live=streams.length>0,total=tin+tout+est;setOdo(total);
  if(!live){$('now').classList.add('off','breathe');if(!$('idle').textContent)$('idle').textContent=IDLE[idleI++%IDLE.length]}}
 // animation loop: only gauge easing + sparkline; paused when hidden
 let last=performance.now(),lastSec=last,running=!document.hidden;
-function frame(t){if(!running)return;const dt=Math.min(.2,(t-last)/1000);last=t;
- if(t-lastSec>=1000){lastSec=t;hist.push(secOut);hist.shift();secOut=0;const m=Math.max(1,...hist);$('spk').setAttribute('points',hist.map((v,i)=>`${i*4},${38-v/m*34}`).join(' '))}
- const target=streams.length?hist[59]:0;const k=Math.min(1,dt*3);const n=curTps+(target-curTps)*k;
+function frame(t){if(!running)return;const gap=(t-last)/1000,dt=Math.min(.2,gap);last=t;
+ // tokens/sec over the REAL elapsed time: rAF can be throttled to well under 1 fps, so a "1 s" bucket may span many seconds
+ if(t-lastSec>=1000){const el=(t-lastSec)/1000;lastSec=t;hist.push(secOut/el);hist.shift();secOut=0;const m=Math.max(1,...hist);$('spk').setAttribute('points',hist.map((v,i)=>`${i*4},${38-v/m*34}`).join(' '))}
+ const target=streams.length?hist[59]:0;const k=gap>2?1:Math.min(1,dt*3);   // after a long stall, snap instead of sweeping
+ const n=curTps+(target-curTps)*k;
  if(Math.abs(n-curTps)>.05||Math.abs(n)<.05&&curTps!==0){curTps=Math.abs(n)<.05?0:n;$('tps').textContent=curTps.toFixed(1);$('arc').setAttribute('stroke-dasharray',Math.min(100,curTps)+' 100')}
  requestAnimationFrame(frame)}
-document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();requestAnimationFrame(frame)}});
+document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();secOut=0;requestAnimationFrame(frame)}});   // drop tokens counted while hidden: they would land in one 1 s bucket and spike the gauge
 setInterval(()=>{if(!streams.length&&!document.hidden)$('idle').textContent=IDLE[idleI++%IDLE.length]},20000);
 setInterval(()=>{if(!document.hidden)refreshNow()},60000);   // keeps runtime chips and "last seen" honest when idle
 // SSE with 60s full-refresh fallback
