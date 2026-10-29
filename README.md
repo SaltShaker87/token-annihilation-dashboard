@@ -1,5 +1,9 @@
 # Token Annihilation Dashboard
 
+<p align="center">
+  <img src="logo.png" alt="A little chip breathing out dollar signs" width="180">
+</p>
+
 Your local GPU is out there obliterating tokens that a cloud provider would have happily billed you for. This keeps score, with maximum drama.
 
 One stdlib-only Python file that counts every token your local models chew through and serves the gloriously over-the-top **DGX Token Annihilator Dashboard**. Built on an NVIDIA DGX Spark, works anywhere Python 3.8+ runs.
@@ -108,6 +112,14 @@ python3 token_annihilator.py --backfill $(date +%s)
 ```
 
 Imports past request lines from `journalctl -u ollama`. Those lines have no token counts, so they are stored but never mixed into totals.
+
+## Tests
+
+```bash
+python3 test_annihilator.py
+```
+
+Stdlib only. Spins up fake Ollama, vLLM and llama.cpp servers on local ports and checks the counting end to end.
 
 ## Uninstall
 

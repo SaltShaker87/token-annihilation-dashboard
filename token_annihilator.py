@@ -234,7 +234,7 @@ def stats(c, since=None):
     F = lambda n: "{:,}".format(int(n or 0))
     M = lambda x: "${:,.4f}".format(x) if x < 1 else "${:,.2f}".format(x)
     def pretty_day(d):
-        try: return datetime.strptime(d, "%Y-%m-%d").strftime("%a %b %-d, %Y")
+        try: return datetime.strptime(d, "%Y-%m-%d").strftime("%a %b {d}, %Y").format(d=datetime.strptime(d, "%Y-%m-%d").day)
         except Exception: return d
     SPD = "output_tokens*1.0/eval_s"; SPW = "eval_s>0 AND output_tokens>=20"
     r = top(SPD, SPW); add("🏎️", "Speed Demon", r and "%.1f tok/s" % r[0], r and f"{r[1]}, fastest single generation", r and r[2], hint="Needs a chat/generate run with 20+ output tokens.")
@@ -262,7 +262,7 @@ def stats(c, since=None):
         dt = datetime.strptime(d[0], "%Y-%m-%d").date(); ds.append(dt)
         cur = cur + 1 if prev and (dt - prev).days == 1 else 1; prev = dt
         if cur > best: best, bend = cur, dt
-    add("🔗", "Iron Streak", best and f"{best} day{'s' if best != 1 else ''}", "Longest run of consecutive active days", date=bend and "ended " + bend.strftime("%b %-d, %Y"))
+    add("🔗", "Iron Streak", best and f"{best} day{'s' if best != 1 else ''}", "Longest run of consecutive active days", date=bend and "ended " + bend.strftime("%b {}, %Y").format(bend.day))
     today = datetime.now().date(); live = 0
     if ds and (today - ds[-1]).days <= 1:
         live = 1
@@ -277,7 +277,7 @@ def stats(c, since=None):
     r = grp(f"date(ts,{LT})", f"CAST(strftime('%H',ts,{LT}) AS INTEGER)<5"); add("🦉", "Night Owl", r and F(r[1]) + " tokens", "Most tokens annihilated between midnight and 5 AM", date=r and pretty_day(r[0]), hint="Requires questionable sleep hygiene.")
     r = grp(f"date(ts,{LT})", f"strftime('%w',ts,{LT}) IN ('0','6')"); add("🛋️", "Weekend Warrior", r and F(r[1]) + " tokens", "Busiest Saturday or Sunday", date=r and pretty_day(r[0]), hint="Touch grass? Never heard of it.")
     r = grp(f"strftime('%H',ts,{LT})")
-    add("📺", "Prime Time", r and datetime.strptime(r[0], "%H").strftime("%-I %p"), r and f"Hour of the day with the most carnage ({F(r[1])} tokens all-time)")
+    add("📺", "Prime Time", r and datetime.strptime(r[0], "%H").strftime("%I %p").lstrip("0"), r and f"Hour of the day with the most carnage ({F(r[1])} tokens all-time)")
     r = c.execute(f"SELECT ts, COALESCE(model,'?') FROM requests WHERE {V} ORDER BY ts LIMIT 1").fetchone()
     add("🐣", "First Blood", r and r[1], "The very first token annihilated", r and r[0])
     add("📆", "Days of Destruction", days and f"{len(days)} day{'s' if len(days) != 1 else ''}", "Total days with any annihilation", date=days and "since " + pretty_day(days[0][0]))
