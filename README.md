@@ -1,24 +1,32 @@
 # Token Annihilation Dashboard
 
-Your local GPU is out there annihilating tokens that a cloud provider would have happily billed you for. This keeps score.
+Your local GPU is out there obliterating tokens that a cloud provider would have happily billed you for. This keeps score, with maximum drama.
 
-A single-file, stdlib-only Python proxy that sits in front of [Ollama](https://ollama.com), counts every token that passes through, and serves a gloriously over-the-top dashboard (the "DGX Token Annihilator Dashboard") showing how many cloud dollars you did not set on fire. Built for an NVIDIA DGX Spark, works anywhere Ollama runs.
+One stdlib-only Python file that counts every token your local models chew through and serves the gloriously over-the-top **DGX Token Annihilator Dashboard**. Built on an NVIDIA DGX Spark, works anywhere Python 3.8+ runs.
 
-**Ollama is never modified.** No config changes, no restarts, no patches. The proxy just forwards requests to Ollama and reads the token counts on the way back. If it ever dies, point your client back at port 11434 and carry on.
+Backends supported, each with its own source label:
+
+| Backend | How it is counted | Label |
+|---|---|---|
+| **Ollama** | Transparent proxy (default `:11435` -> `:11434`) | Ollama |
+| **vLLM** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | vLLM |
+| **llama.cpp** (`llama-server`) | Read-only tail of the server log (`LLAMA_LOG`) and/or the OpenAI-compatible proxy | llama.cpp |
+
+**Your inference servers are never modified.** The proxies just forward requests and read the token counts on the way back, and the llama.cpp log tail never connects to the server at all. Everything fails open: if logging breaks, your request still succeeds. If the dashboard dies, point your client back at the real port and carry on.
 
 ## Features
 
-- **Transparent proxy on port 11435** forwarding everything to Ollama on `127.0.0.1:11434`. Streaming responses pass through chunk by chunk, never buffered. Fails open: if logging breaks, your request still succeeds.
-- Counts tokens for `/api/generate`, `/api/chat`, `/api/embed`, `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`, stored in a tiny SQLite file.
-- **Dashboard on port 11480**: tokens annihilated (input/output), requests, output tokens/sec, daily devastation log, hungriest models.
-- **GitHub-style contribution calendar** of tokens per day for the last year, in NVIDIA green, with hover tooltips.
-- **Cloud bills obliterated**: estimated savings at list price vs Claude Opus 5.5, Claude Sonnet 5.5, GPT-6.1 Sol, GPT-6.1 Terra and Grok 4.7.
-- **`prices.json`**: USD per 1M input/output tokens, last checked **2026-10-28** against each provider's official pricing page (sources inside). Edit it whenever prices change; the page rereads it on every load.
-- Optional backfill of past request counts from the Ollama journal (no token counts exist there, so these are stored but never mixed into totals).
+- **Live odometer** of tokens obliterated (all time, never resets), live tokens/sec gauge and "Now annihilating" card over Server-Sent Events (throttled to ~4 updates/s, ~0.2% CPU idle).
+- **Time filter**: 7 days / 30 days / 60 days / 90 days / All time. Filters the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. The odometer and trophies always stay all-time.
+- **Model leaderboard** (apex predators) with per-source chips: tokens, requests, average and best tok/s, biggest single output.
+- **Trophy case**: 27 personal records (Speed Demon, Night Owl, Week of Wrath, Iron Streak, Reigning Champion...).
+- **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy: 1M and 10M tokens, every 100M, a much bigger Total Eradication show at every 1B, and every $100 saved. "🎉 test the party" in the footer previews it.
+- **Trip meter** with a reset button and a "Glovebox" of past trips. Nothing is ever deleted.
+- **📸 Share card**: one click downloads a 1200x630 PNG of your carnage.
+- **GitHub-style calendar** of tokens per day for the last year, in NVIDIA green.
+- **Cloud invoices eradicated** vs Claude Opus 5.5, Claude Sonnet 5.5, GPT-6.1 Sol, GPT-6.1 Terra and Grok 4.7, from `prices.json` (list prices checked 2026-10-28, sources inside; edit freely).
 
 ## Install
-
-Requires Python 3.8+ and nothing else.
 
 ```bash
 git clone https://github.com/SaltShaker87/token-annihilation-dashboard ~/token-annihilation-dashboard
@@ -26,47 +34,80 @@ cd ~/token-annihilation-dashboard
 python3 token_annihilator.py            # try it in the foreground
 ```
 
-Run it as a systemd user service (no sudo):
+Open `http://<your-tailscale-ip>:11480` (it binds to your Tailscale IP if `tailscale` is installed, else `127.0.0.1`).
+
+Run it as a systemd user service (no sudo). Edit the `Environment=` lines in the unit file first if you use vLLM or llama.cpp:
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp token-annihilator.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now token-annihilator
-loginctl enable-linger "$USER"   # keep running after logout (may need admin on some systems)
+loginctl enable-linger "$USER"   # keep running after logout
 ```
 
-### Configuration
+## Backend setup
 
-| Setting | Env var | Flag | Default |
-|---|---|---|---|
-| Proxy bind | `PROXY_BIND` | `--proxy-bind` | `0.0.0.0` |
-| Proxy port | `PROXY_PORT` | `--proxy-port` | `11435` |
-| Dashboard bind | `DASH_BIND` | `--dash-bind` | output of `tailscale ip -4`, else `127.0.0.1` |
-| Dashboard port | `DASH_PORT` | `--dash-port` | `11480` |
-| Ollama host/port | `UPSTREAM_HOST` / `UPSTREAM_PORT` | | `127.0.0.1` / `11434` |
+### Ollama
 
-Then open `http://<your-tailscale-ip>:11480`.
-
-## Point clients at it
-
-Only requests that go through the proxy get counted. Use port 11435 instead of 11434:
+On by default. Point clients at port **11435** instead of 11434:
 
 ```bash
 OLLAMA_HOST=127.0.0.1:11435 ollama run <model>
 ```
 
-OpenAI-compatible clients: set the base URL to `http://127.0.0.1:11435/v1`.
+OpenAI-style clients: base URL `http://127.0.0.1:11435/v1`. Not using Ollama? Set `OLLAMA_PROXY=0`.
 
-**Streaming with the OpenAI API?** Send `"stream_options": {"include_usage": true}`, otherwise the stream carries no usage numbers and the annihilation goes unrecorded. Native `/api/*` endpoints always report counts.
+### vLLM
 
-## Backfill (optional)
+Start vLLM as usual (say on port 8000) and add a counting proxy in front of it:
+
+```bash
+OPENAI_PROXIES="vllm:8001=127.0.0.1:8000" python3 token_annihilator.py
+```
+
+Then point your clients at `http://127.0.0.1:8001/v1`. The proxy reads the `usage` field from every response. For streaming requests it automatically adds `"stream_options": {"include_usage": true}` (only when the client did not set `stream_options` itself) so the final chunk carries the token counts. Disable that with `INJECT_USAGE=0`.
+
+### llama.cpp
+
+Two options, use either or both:
+
+1. **Log tail (zero contact with the server).** Save llama-server's output to a file and point `LLAMA_LOG` at it:
+
+   ```bash
+   llama-server -m model.gguf --port 8080 2>&1 | tee ~/llama_server.log
+   LLAMA_LOG=~/llama_server.log python3 token_annihilator.py
+   ```
+
+   The file is polled every `LLAMA_POLL_S` seconds (default 15), and the model name comes from the GGUF file name. To import a log that already exists, run `python3 token_annihilator.py --llama-backfill` once.
+
+2. **Counting proxy**, same as vLLM: `OPENAI_PROXIES="llamacpp:8081=127.0.0.1:8080"`, then use port 8081.
+
+Don't count the same server both ways at once, or its tokens are counted twice. Several proxies can be combined: `OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080"`.
+
+## Configuration
+
+| Env var | Default | What |
+|---|---|---|
+| `DASH_BIND` / `DASH_PORT` | Tailscale IP or `127.0.0.1` / `11480` | Dashboard address |
+| `PROXY_BIND` / `PROXY_PORT` | `0.0.0.0` / `11435` | Ollama proxy listen address |
+| `UPSTREAM_HOST` / `UPSTREAM_PORT` | `127.0.0.1` / `11434` | Where Ollama lives |
+| `OLLAMA_PROXY` | `1` | `0` disables the Ollama proxy |
+| `OPENAI_PROXIES` | empty | `source:listen_port=upstream_host:port`, comma-separated |
+| `INJECT_USAGE` | `1` | Ask streaming `/v1` requests to include usage |
+| `LLAMA_LOG` | empty (off) | llama-server log file to tail |
+| `LLAMA_POLL_S` | `15` | Log poll interval, seconds |
+| `LLAMA_MODEL` | `llama.cpp` | Model name if the log has no load line |
+| `LLAMA_STARTS` | empty | Optional comma-separated epoch start times for exact `--llama-backfill` timestamps |
+| `STATS_DB` | `./stats.db` | SQLite file |
+
+## Backfill Ollama history (optional)
 
 ```bash
 python3 token_annihilator.py --backfill $(date +%s)
 ```
 
-Imports past request lines from `journalctl -u ollama` (timestamps, endpoints, durations only).
+Imports past request lines from `journalctl -u ollama`. Those lines have no token counts, so they are stored but never mixed into totals.
 
 ## Uninstall
 
@@ -76,7 +117,7 @@ rm ~/.config/systemd/user/token-annihilator.service
 rm -rf ~/token-annihilation-dashboard
 ```
 
-Ollama was never touched, so there is nothing to undo there.
+Your inference servers were never touched, so there is nothing to undo there.
 
 ## License
 
