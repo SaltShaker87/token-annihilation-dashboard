@@ -764,7 +764,8 @@ async function refreshNow(){try{ST=await(await fetch('api/stats?days='+rDays,{ca
 document.querySelectorAll('#seg button').forEach(b=>b.onclick=()=>setRange(+b.dataset.d,true));
 renderAll();setRange(rDays,rDays!=0);
 // state from SSE
-let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0;
+let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0,arr=[];   // arr: [time, tokens] arrivals for the gauge
+const WIN=3000;   // gauge = tokens/sec over a trailing 3 s wall-clock window
 function onMsg(m){streams=m.streams||[];
  for(const f of (m.done||[])){tin+=f.in;tout+=f.out;nreq++;if(f.eval_s&&f.out){evOut+=f.out;evS+=f.eval_s;RG.ev_out+=f.out;RG.ev_s+=f.eval_s}RG.tin+=f.in;RG.tout+=f.out;RG.nreq++;T.t+=f.in+f.out;
   const dd=D.days.find(x=>x[0]==D.today);if(dd){dd[1]+=f.in;dd[2]+=f.out}else D.days.unshift([D.today,f.in,f.out]);
@@ -772,7 +773,7 @@ function onMsg(m){streams=m.streams||[];
   for(const k of (f.ms||[]))celebrate(k);
   showDone(f)}
  if(m.done&&m.done.length){tables();renderTrip();nextMilestone();refreshSoon();if(T.t>mx){mx=T.t;paint()}}
- const e=streams.reduce((a,s)=>a+s.out_est,0);secOut+=Math.max(0,e-prevEst);prevEst=streams.length?e:0;est=e;
+ const e=streams.reduce((a,s)=>a+s.out_est,0),de=Math.max(0,e-prevEst);secOut+=de;if(de)arr.push([performance.now(),de]);prevEst=streams.length?e:0;est=e;
  if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent='~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
  draw()}
 function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
@@ -790,11 +791,14 @@ let last=performance.now(),lastSec=last,running=!document.hidden;
 function frame(t){if(!running)return;const gap=(t-last)/1000,dt=Math.min(.2,gap);last=t;
  // tokens/sec over the REAL elapsed time: rAF can be throttled to well under 1 fps, so a "1 s" bucket may span many seconds
  if(t-lastSec>=1000){const el=(t-lastSec)/1000;lastSec=t;hist.push(secOut/el);hist.shift();secOut=0;const m=Math.max(1,...hist);$('spk').setAttribute('points',hist.map((v,i)=>`${i*4},${38-v/m*34}`).join(' '))}
- const target=streams.length?hist[59]:0;const k=gap>2?1:Math.min(1,dt*3);   // after a long stall, snap instead of sweeping
+ // Rate over a trailing wall-clock window, not the last 1 s bucket or "is a stream open right now": SSE ticks land unevenly
+ // in buckets and back-to-back requests leave brief no-stream gaps, which made the target flip to 0 and back (the sweep).
+ while(arr.length&&t-arr[0][0]>WIN)arr.shift();
+ const target=arr.reduce((a,x)=>a+x[1],0)/(WIN/1000);const k=gap>2?1:Math.min(1,dt*3);   // after a long stall, snap instead of sweeping
  const n=curTps+(target-curTps)*k;
  if(Math.abs(n-curTps)>.05||Math.abs(n)<.05&&curTps!==0){curTps=Math.abs(n)<.05?0:n;$('tps').textContent=curTps.toFixed(1);$('arc').setAttribute('stroke-dasharray',Math.min(100,curTps)+' 100')}
  requestAnimationFrame(frame)}
-document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();secOut=0;requestAnimationFrame(frame)}});   // drop tokens counted while hidden: they would land in one 1 s bucket and spike the gauge
+document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();secOut=0;requestAnimationFrame(frame)}});   // drop tokens counted while hidden from the sparkline bucket; the gauge window is wall-clock, so it shows the real current rate
 setInterval(()=>{if(!streams.length&&!document.hidden)$('idle').textContent=IDLE[idleI++%IDLE.length]},20000);
 setInterval(()=>{if(!document.hidden)refreshNow()},60000);   // keeps runtime chips and "last seen" honest when idle
 // SSE with 60s full-refresh fallback
