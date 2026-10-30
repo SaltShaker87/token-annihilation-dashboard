@@ -764,7 +764,7 @@ async function refreshNow(){try{ST=await(await fetch('api/stats?days='+rDays,{ca
 document.querySelectorAll('#seg button').forEach(b=>b.onclick=()=>setRange(+b.dataset.d,true));
 renderAll();setRange(rDays,rDays!=0);
 // state from SSE
-let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0,arr=[];   // arr: [time, tokens] arrivals for the gauge
+let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0,arr=[],primed=false;   // primed: false until the first SSE message after (re)connect sets the out_est baseline   // arr: [time, tokens] arrivals for the gauge
 const WIN=3000;   // gauge = tokens/sec over a trailing 3 s wall-clock window
 function onMsg(m){streams=m.streams||[];
  for(const f of (m.done||[])){tin+=f.in;tout+=f.out;nreq++;if(f.eval_s&&f.out){evOut+=f.out;evS+=f.eval_s;RG.ev_out+=f.out;RG.ev_s+=f.eval_s}RG.tin+=f.in;RG.tout+=f.out;RG.nreq++;T.t+=f.in+f.out;
@@ -773,7 +773,8 @@ function onMsg(m){streams=m.streams||[];
   for(const k of (f.ms||[]))celebrate(k);
   showDone(f)}
  if(m.done&&m.done.length){tables();renderTrip();nextMilestone();refreshSoon();if(T.t>mx){mx=T.t;paint()}}
- const e=streams.reduce((a,s)=>a+s.out_est,0),de=Math.max(0,e-prevEst);secOut+=de;if(de)arr.push([performance.now(),de]);prevEst=streams.length?e:0;est=e;
+ const e=streams.reduce((a,s)=>a+s.out_est,0),de=primed?Math.max(0,e-prevEst):0;primed=true;secOut+=de;   // the first message carries every token the open streams produced BEFORE this page connected; counting it as a 3 s arrival spiked the gauge (80 then settling at 30)
+ if(de)arr.push([performance.now(),de]);prevEst=streams.length?e:0;est=e;
  if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent='~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
  draw()}
 function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
@@ -803,7 +804,7 @@ setInterval(()=>{if(!streams.length&&!document.hidden)$('idle').textContent=IDLE
 setInterval(()=>{if(!document.hidden)refreshNow()},60000);   // keeps runtime chips and "last seen" honest when idle
 // SSE with 60s full-refresh fallback
 let fb=null;function connect(){const es=new EventSource('events');
- es.onopen=()=>{$('conn').textContent='Live: extinction feed connected';$('conn').classList.remove('off');if(fb){clearTimeout(fb);fb=null}};
+ es.onopen=()=>{primed=false;$('conn').textContent='Live: extinction feed connected';$('conn').classList.remove('off');if(fb){clearTimeout(fb);fb=null}};
  es.onmessage=e=>{try{onMsg(JSON.parse(e.data))}catch(_){}};
  es.onerror=()=>{$('conn').textContent='Feed lost. Refreshing every 60s like a caveman';$('conn').classList.add('off');if(!fb)fb=setTimeout(()=>location.reload(),60000)}}
 if(window.EventSource)connect();else setTimeout(()=>location.reload(),60000);
