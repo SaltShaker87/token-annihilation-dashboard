@@ -244,5 +244,12 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(r[:2], (2, 5)); self.assertTrue(0.1 < r[2] < 2, r)
 
 
+
+class GaugeTests(unittest.TestCase):
+    def test_first_sse_message_only_sets_the_baseline(self):
+        # tokens already streamed before the page connected must not count as a 3 s arrival (gauge overshoot on load)
+        self.assertIn("de=primed?Math.max(0,e-prevEst):0;primed=true;", ta.PAGE)
+        self.assertIn("es.onopen=()=>{primed=false;", ta.PAGE)
+
 if __name__ == "__main__":
     unittest.main()
