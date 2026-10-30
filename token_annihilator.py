@@ -604,7 +604,7 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 <div class=top><div class=brand><picture><source srcset="static/icon-128.png" media="(prefers-reduced-motion: reduce)"><img src="static/icon.webp" width=64 height=64 alt="Furious GPU chip devouring tokens"></picture><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Preview a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
 <div class=fbar><div class=seg id=seg><button data-d=1>24 hours</button><button data-d=7>7 days</button><button data-d=30>30 days</button><button data-d=60>60 days</button><button data-d=90>90 days</button><button data-d=0>All time</button></div><span class=muted id=segSub></span><div class=rts id=rts></div></div>
 <div class="row r1">
- <div class=card id=odoCard><h2>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=words id=odoWords></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
+ <div class=card id=odoCard><h2 id=odoH>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=words id=odoWords></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
   <div class=lbl id=rngLbl style="margin-top:14px;color:#9fd14a"></div><div class=grid style="margin-top:6px"><div><div class=lbl>Prompts devoured (input)</div><div class=med id=tin></div></div><div><div class=lbl>Vocabulary purged (output)</div><div class=med id=tout></div></div><div><div class=lbl>Lineages erased (requests)</div><div class=med id=nreq></div></div><div><div class=lbl>Avg extermination speed</div><div class=med id=avg></div></div></div></div>
  <div class=card><h2>Rate of extermination, right now</h2><svg viewBox="0 0 200 120" width=100%><path d="M20 105 A80 80 0 0 1 180 105" stroke="#232833" stroke-width=14 fill=none stroke-linecap=round /><path id=arc d="M20 105 A80 80 0 0 1 180 105" stroke="#76B900" stroke-width=14 fill=none stroke-linecap=round pathLength=100 stroke-dasharray="0 100"/><text x=100 y=92 text-anchor=middle font-size=30 font-weight=700 fill="#76B900" id=tps>0.0</text><text x=100 y=112 text-anchor=middle class=ct style="font-size:11px">tokens / sec (live estimate)</text></svg>
   <svg viewBox="0 0 240 40" width=100% height=40 preserveAspectRatio=none><polyline id=spk fill=none stroke="#76B900" stroke-width=1.5 points=""/></svg><div class=muted>last 60 seconds of mayhem</div></div>
@@ -750,14 +750,15 @@ $('shareDl').onclick=()=>{const a=document.createElement('a');a.href=shareUrl;a.
 $('shareCopy').onclick=async()=>{try{await navigator.clipboard.write([new ClipboardItem({'image/png':shareBlob})]);$('shareMsg').textContent='Copied. Paste it somewhere the cloud can see it.'}catch(_){$('shareMsg').textContent='The clipboard refused. Download it instead.'}};
 $('shareNative').onclick=async()=>{try{await navigator.share({files:[new File([shareBlob],shareName(),{type:'image/png'})],title:'Token carnage report'})}catch(_){}};
 $('shareX').onclick=()=>$('shareDlg').close();$('shareDlg').onclick=e=>{if(e.target==$('shareDlg'))$('shareDlg').close()};
-// ===== time filter (7/30/60/90/all). Odometer + trophies stay all-time. =====
+// ===== time filter (24h/7/30/60/90/all). The odometer follows the window (live increments land in RG); trophies stay all-time. =====
 let RG=ST.rng,rDays=+(localStorage.getItem('tad.range')||0);
 const RNAME=d=>d==1?'last 24 hours':d?'last '+d+' days':'all time';
 function setRange(d,fetchIt){rDays=d;localStorage.setItem('tad.range',d);
  document.querySelectorAll('#seg button').forEach(b=>b.classList.toggle('on',+b.dataset.d==d));
  if(d){const c=new Date(today);c.setDate(c.getDate()-(d==1?1:d-1));cutoff=iso(c)}else cutoff='';   // rolling 24h touches yesterday too
+ $('odoH').textContent=d?'Tokens obliterated ('+RNAME(d)+', no refunds)':'Tokens obliterated (all time, forever, no refunds)';
  $('rngLbl').textContent='In the '+RNAME(d)+':';['savRng','lbRng','logRng'].forEach(i=>$(i).textContent='('+RNAME(d)+')');
- $('segSub').textContent=d?'Showing the '+RNAME(d)+'. The odometer and trophies never forget.':'Showing everything since the first drop of blood.';
+ $('segSub').textContent=d?'Showing the '+RNAME(d)+'. The trophies never forget.':'Showing everything since the first drop of blood.';
  paint();tables();draw();if(fetchIt)refreshNow()}
 async function refreshNow(){try{ST=await(await fetch('api/stats?days='+rDays,{cache:'no-store'})).json();RG=ST.rng;renderAll();draw()}catch(_){}}
 document.querySelectorAll('#seg button').forEach(b=>b.onclick=()=>setRange(+b.dataset.d,true));
@@ -776,7 +777,7 @@ function onMsg(m){streams=m.streams||[];
  draw()}
 function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
  if(!matchMedia('(prefers-reduced-motion: reduce)').matches&&!document.hidden){const c=$('now'),p=$('pulse');p.classList.remove('go');void p.offsetWidth;p.classList.add('go');for(let i=0;i<14;i++){const s=document.createElement('i');s.className='spark';const a=i/14*6.28;s.style.left='85%';s.style.top='50%';s.style.setProperty('--dx',Math.cos(a)*60+'px');s.style.setProperty('--dy',Math.sin(a)*40+'px');c.appendChild(s);setTimeout(()=>s.remove(),850)}}}
-function draw(){const live=streams.length>0,total=tin+tout+est;setOdo(total);
+function draw(){const live=streams.length>0,total=(rDays?RG.tin+RG.tout:tin+tout)+est;setOdo(total);   // window total + live increments (RG ticks on every finished request); all time = lifetime count
  $('odoSub').textContent=live?`including ~${fmt(est)} in flight (estimate until the stream finishes)`:'exact counts, straight from your inference backends';
  $('tin').textContent=fmt(RG.tin);$('tout').textContent=fmt(RG.tout);$('nreq').textContent=fmt(RG.nreq);$('avg').textContent=RG.ev_s>0?(RG.ev_out/RG.ev_s).toFixed(1)+' tok/s':'–';
  if(hero)$('sav').textContent=money(cost(hero,RG.tin,RG.tout));
