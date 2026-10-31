@@ -8,6 +8,9 @@ WorkingDirectory=%h/token-annihilation-dashboard
 # Ollama :11435 runs by default; vLLM :8001 / llama.cpp :8081 open once vLLM / llama-server answer on 8000 / 8080.
 # To list your own instead (started right away, e.g. vLLM + NVIDIA NIM):
 # Environment=OPENAI_PROXIES=vllm:8001=127.0.0.1:8000,nim:8002=127.0.0.1:9000
+# llama.cpp only, proxy fixed on 8081 (server stays on 8080, clients use 8081):
+# Environment=OPENAI_PROXIES=llamacpp:8081=127.0.0.1:8080
+# Environment=STATS_DB=%h/token-annihilation-dashboard/stats.db
 # Environment=LLAMA_LOG=%h/llama_server.log
 # Environment=OLLAMA_PROXY=0
 # Environment=DASH_BIND=127.0.0.1 PROXY_PORT=11435 DASH_PORT=11480
