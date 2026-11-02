@@ -25,6 +25,7 @@ Anything that speaks `/v1/chat/completions`, `/v1/completions`, `/v1/responses` 
 ## Features
 
 - **Live odometer** of tokens obliterated (all time, never resets), live tokens/sec gauge and "Now annihilating" card over Server-Sent Events (throttled to ~4 updates/s, ~0.2% CPU idle).
+- **Header mascot**: the chip robot at the top left plays a short inhale loop while a request is in flight (including a non-streamed request that is still waiting) and sits on the idle still otherwise. A brief gap between requests does not restart the loop. If the live feed drops, or the browser asks for reduced motion, it stays on the still.
 - **Time filter**: 24 hours (rolling) / 7 days / 30 days / 60 days / 90 days / All time. Filters the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. The odometer and trophies always stay all-time.
 - **Model leaderboard** (apex predators) with per-source chips: tokens, requests, average and best tok/s, biggest single output.
 - **Trophy case**: 27 personal records (Speed Demon, Night Owl, Week of Wrath, Iron Streak, Reigning Champion...).
