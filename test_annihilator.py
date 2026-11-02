@@ -291,6 +291,60 @@ class MascotTests(unittest.TestCase):
                 self.assertIn(b"WEBP", body[:16], path)
 
 
+
+class OdometerTests(unittest.TestCase):
+    # runs the page's real odometer code in node against a fake DOM and reads back what would be drawn
+    def run_odo(self, seq, width=900):
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        p = ta.PAGE
+        js = p[p.index("const ODO=$('odo')"):p.index("if(window.ResizeObserver)")]
+        stub = """
+const W=%d;let HTML='';const cls=new Set();
+const odo={style:{setProperty(){}},parentElement:{clientWidth:W},classList:{toggle(c,on){on?cls.add(c):cls.delete(c)}},
+ set innerHTML(v){HTML=v},get innerHTML(){return HTML},title:'',
+ querySelectorAll(){return Array.from({length:(HTML.match(/class=dig>/g)||[]).length},()=>({style:{},parentElement:{classList:{add(){},remove(){}},offsetWidth:0}}))}};
+const words_el={textContent:''};const $=id=>id=='odo'?odo:words_el;const fmt=n=>Math.round(n).toLocaleString('en-US');
+""" % width
+        drive = """const out=[];for(const n of %s){setOdo(n);const shown=reels.map(r=>Math.round(-parseFloat(r.style.transform.slice(11))/DH)).join('');
+ const k=HTML.indexOf('<sup>'),sup=k<0?null:parseInt(HTML.slice(k+5));
+ out.push({reels:reels.length,shown,sci:cls.has('sci'),exp:sup,commas:HTML.split('>,<').length-1,title:odo.title})}
+console.log(JSON.stringify(out))""" % json.dumps(seq)
+        out = subprocess.run([node, "-e", stub + js + drive], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_reels_show_exactly_the_digits_of_the_number(self):
+        nums = [0, 7, 12935412, 999999999, 1000000000, 1234567890, 123456789012]
+        for n, r in zip(nums, self.run_odo(nums)):
+            self.assertFalse(r["sci"], n)
+            self.assertEqual(r["shown"], str(n))           # no leading zeros, nothing cut off
+            self.assertEqual(r["commas"], (len(str(n)) - 1) // 3)
+
+    def test_count_shrinks_back_when_the_range_gets_smaller(self):
+        r = self.run_odo([98765432109, 12935412, 5])
+        self.assertEqual([x["shown"] for x in r], ["98765432109", "12935412", "5"])
+
+    def test_huge_numbers_switch_to_scientific_notation(self):
+        self.assertFalse(self.run_odo([4512345678901])[0]["sci"])   # 4.5T still fits as reels
+        r = self.run_odo([45123456789012, 1234567890123456])
+        self.assertEqual((r[0]["sci"], r[0]["shown"], r[0]["exp"]), (True, "4512", 13))
+        self.assertEqual((r[1]["sci"], r[1]["shown"], r[1]["exp"]), (True, "1234", 15))
+        self.assertEqual(r[1]["title"], "1,234,567,890,123,456 tokens")   # exact count still available
+
+    def test_switching_ranges_flips_notation_both_ways(self):
+        r = self.run_odo([2345678901234567, 3456789, 2345678901234999])
+        self.assertEqual([x["sci"] for x in r], [True, False, True])
+        self.assertEqual(r[1]["shown"], "3456789")
+        self.assertEqual(r[2]["exp"], 15)
+
+    def test_narrow_card_uses_notation_before_reels_get_unreadable(self):
+        n = 123456789012
+        self.assertFalse(self.run_odo([n], width=900)[0]["sci"])
+        self.assertTrue(self.run_odo([n], width=200)[0]["sci"])
+
 class GaugeTests(unittest.TestCase):
     def test_first_sse_message_only_sets_the_baseline(self):
         # tokens already streamed before the page connected must not count as a 3 s arrival (gauge overshoot on load)
