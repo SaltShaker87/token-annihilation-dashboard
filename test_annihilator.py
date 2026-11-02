@@ -247,6 +247,50 @@ class ProxyTests(unittest.TestCase):
 
 
 
+class MascotTests(unittest.TestCase):
+    def test_brand_uses_the_inhaling_robot(self):
+        p = ta.PAGE
+        self.assertIn('id=mascotVid', p)
+        self.assertIn('id=mascotStill', p)
+        self.assertIn('<video id=mascotVid muted playsinline loop preload=none poster="static/mascot-idle.png"', p)
+        self.assertLess(p.index('static/mascot-inhale.webm'), p.index('static/mascot-inhale.mp4'))
+        self.assertIn('type="video/webm"', p)
+        self.assertIn('type="video/mp4"', p)
+        self.assertIn('srcset="static/mascot-idle.webp"', p)
+        self.assertIn('alt="Angry chip robot inhaling tokens"', p)
+        self.assertIn('mascotSync()', p)
+        self.assertIn('setTimeout(go,1500)', p)
+        self.assertIn('if(mascotOn)', p)   # an SSE tick must not restart the loop at frame 0
+        self.assertIn('mascotIdle(true)', p)   # a dropped feed goes idle immediately
+        self.assertIn(".brand .mascot video{display:none!important}", p)
+        self.assertNotIn("static/icon-128.png", p)
+        self.assertIn('src="static/icon.webp"', p)   # milestone box still uses the old art
+        self.assertIn('class=orb src="static/icon.webp"', p)
+        self.assertIn('poster="static/icon-180.png"', p)   # share / celebration video untouched
+
+    def test_mascot_files_are_served_with_their_types(self):
+        srv = ta.TS(("127.0.0.1", 0), ta.Dash)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        port = srv.server_address[1]
+        expect = [
+            ("/static/mascot-idle.png", "image/png", b"\x89PNG"),
+            ("/static/mascot-idle.webp", "image/webp", b"RIFF"),
+            ("/static/mascot-inhale.webp", "image/webp", b"RIFF"),
+            ("/static/mascot-inhale.webm", "video/webm", b"\x1a\x45\xdf\xa3"),
+            ("/static/mascot-inhale.mp4", "video/mp4", b"ftyp"),
+        ]
+        for path, ctype, magic in expect:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", path)
+            r = c.getresponse(); body = r.read(); c.close()
+            self.assertEqual(r.status, 200, path)
+            self.assertEqual(r.getheader("Content-Type"), ctype, path)
+            self.assertIn(magic, body[:16], (path, body[:16]))
+            if ctype == "image/webp":
+                self.assertIn(b"WEBP", body[:16], path)
+
+
 class GaugeTests(unittest.TestCase):
     def test_first_sse_message_only_sets_the_baseline(self):
         # tokens already streamed before the page connected must not count as a 3 s arrival (gauge overshoot on load)

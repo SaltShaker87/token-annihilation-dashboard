@@ -569,7 +569,7 @@ class Dash(http.server.BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>DGX Token Annihilator Dashboard</title><link rel=icon type=image/png sizes=32x32 href="static/icon-32.png"><link rel=apple-touch-icon sizes=180x180 href="static/icon-180.png"><style>
 :root{--g:#76B900}
 *{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0b0d10;color:#e6e6e6;margin:0;padding:20px 28px;max-width:1240px;margin:auto}
-h1{font-weight:800;margin:0;color:var(--g);letter-spacing:.02em}.brand{display:flex;align-items:center;gap:14px}.brand img{border-radius:14px;display:block}.top{display:flex;justify-content:space-between;align-items:center}
+h1{font-weight:800;margin:0;color:var(--g);letter-spacing:.02em}.brand{display:flex;align-items:center;gap:14px}.brand .mascot{position:relative;width:80px;height:80px;flex:none;border-radius:14px;overflow:hidden;background:#0b0d10}.brand .mascot picture{display:block;position:relative;z-index:1;line-height:0}.brand .mascot img,.brand .mascot video{width:80px;height:80px;display:block;object-fit:cover;background:#0b0d10}.brand .mascot video{position:absolute;inset:0}.top{display:flex;justify-content:space-between;align-items:center}
 .badge{border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;border:1px solid #2f4a10;color:#9fd14a;background:#13200a}.badge.off{color:#ffb84d;background:#2a1d00;border-color:#6b4a00}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;margin:0 0 8px}h3{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;margin:26px 0 8px}
 .muted{color:#6b7285;font-size:12px}.card{background:#14171d;border:1px solid #232833;border-radius:14px;padding:14px;position:relative;overflow:hidden}
@@ -629,9 +629,9 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 @media (max-width:900px){.r1,.r2,.two{grid-template-columns:1fr}}
 .seg{max-width:100%;overflow-x:auto}.seg button{white-space:nowrap}
 @media (max-width:600px){body{padding:16px}.top{flex-wrap:wrap;gap:12px}h1{font-size:24px}.seg{display:flex}.seg button{flex:1;padding:7px 4px;font-size:12px}.rts{margin-left:0}}
-@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.brand .mascot video{display:none!important}.brand .mascot picture{display:block!important}}
 </style></head><body>
-<div class=top><div class=brand><picture><source srcset="static/icon-128.png" media="(prefers-reduced-motion: reduce)"><img src="static/icon.webp" width=64 height=64 alt="Furious GPU chip devouring tokens"></picture><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Preview a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
+<div class=top><div class=brand><div class=mascot id=mascot><picture id=mascotStill><source srcset="static/mascot-idle.webp" type="image/webp"><img src="static/mascot-idle.png" width=80 height=80 alt="Angry chip robot inhaling tokens"></picture><video id=mascotVid muted playsinline loop preload=none poster="static/mascot-idle.png" aria-hidden=true aria-label="Angry chip robot inhaling tokens"><source src="static/mascot-inhale.webm" type="video/webm"><source src="static/mascot-inhale.mp4" type="video/mp4"></video></div><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Preview a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
 <div class=fbar><div class=seg id=seg><button data-d=1>24 hours</button><button data-d=7>7 days</button><button data-d=30>30 days</button><button data-d=60>60 days</button><button data-d=90>90 days</button><button data-d=0>All time</button></div><span class=muted id=segSub></span><div class=rts id=rts></div></div>
 <div class="row r1">
  <div class=card id=odoCard><h2 id=odoH>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=words id=odoWords></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
@@ -798,6 +798,23 @@ renderAll();setRange(rDays,rDays!=0);
 // state from SSE
 let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0,arr=[],primed=false;   // primed: false until the first SSE message after (re)connect sets the out_est baseline   // arr: [time, tokens] arrivals for the gauge
 const WIN=3000;   // gauge = tokens/sec over a trailing 3 s wall-clock window
+// Header robot: play the inhale loop only while something is in flight. The idle still is frame 0 of that loop.
+let mascotOn=false,mascotHold=0;
+function mascotPlay(){
+ if(matchMedia('(prefers-reduced-motion: reduce)').matches){mascotIdle(true);return}
+ if(mascotHold){clearTimeout(mascotHold);mascotHold=0}
+ const v=$('mascotVid'),still=$('mascotStill');
+ if(mascotOn){if(still.hidden&&v.paused){const p=v.play();p&&p.catch(()=>{})}return}   // already in the loop: an SSE tick must not jump back to frame 0
+ mascotOn=true;v.muted=true;
+ const go=()=>{const show=()=>{if(!mascotOn)return;still.hidden=true;v.setAttribute('aria-hidden','false')};const p=v.play();if(p)p.then(show).catch(()=>{});else show()};
+ if(v.currentTime>0.04){const once=()=>{v.removeEventListener('seeked',once);if(mascotOn)go()};v.addEventListener('seeked',once);try{v.currentTime=0}catch(_){go()}}
+ else go()}
+function mascotIdle(now){
+ const go=()=>{mascotHold=0;mascotOn=false;const v=$('mascotVid');v.pause();v.setAttribute('aria-hidden','true');$('mascotStill').hidden=false};
+ if(now){if(mascotHold){clearTimeout(mascotHold);mascotHold=0}go();return}
+ if(!mascotOn||mascotHold)return;   // one grace timer; later empty ticks must not keep postponing it
+ mascotHold=setTimeout(go,1500)}
+function mascotSync(){streams.length?mascotPlay():mascotIdle(false)}
 function onMsg(m){streams=m.streams||[];
  for(const f of (m.done||[])){tin+=f.in;tout+=f.out;nreq++;if(f.eval_s&&f.out){evOut+=f.out;evS+=f.eval_s;RG.ev_out+=f.out;RG.ev_s+=f.eval_s}RG.tin+=f.in;RG.tout+=f.out;RG.nreq++;T.t+=f.in+f.out;
   const dd=D.days.find(x=>x[0]==D.today);if(dd){dd[1]+=f.in;dd[2]+=f.out}else D.days.unshift([D.today,f.in,f.out]);
@@ -808,7 +825,7 @@ function onMsg(m){streams=m.streams||[];
  const e=streams.reduce((a,s)=>a+s.out_est,0),de=primed?Math.max(0,e-prevEst):0;primed=true;secOut+=de;   // the first message carries every token the open streams produced BEFORE this page connected; counting it as a 3 s arrival spiked the gauge (80 then settling at 30)
  if(de)arr.push([performance.now(),de]);prevEst=streams.length?e:0;est=e;
  if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent=s.wait?'waiting for the full answer...':'~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
- draw()}
+ draw();mascotSync()}
 function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
  if(!matchMedia('(prefers-reduced-motion: reduce)').matches&&!document.hidden){const c=$('now'),p=$('pulse');p.classList.remove('go');void p.offsetWidth;p.classList.add('go');for(let i=0;i<14;i++){const s=document.createElement('i');s.className='spark';const a=i/14*6.28;s.style.left='85%';s.style.top='50%';s.style.setProperty('--dx',Math.cos(a)*60+'px');s.style.setProperty('--dy',Math.sin(a)*40+'px');c.appendChild(s);setTimeout(()=>s.remove(),850)}}}
 function draw(){const live=streams.length>0,total=(rDays?RG.tin+RG.tout:tin+tout)+est;setOdo(total);   // window total + live increments (RG ticks on every finished request); all time = lifetime count
@@ -831,14 +848,14 @@ function frame(t){if(!running)return;const gap=(t-last)/1000,dt=Math.min(.2,gap)
  const n=curTps+(target-curTps)*k;
  if(Math.abs(n-curTps)>.05||Math.abs(n)<.05&&curTps!==0){curTps=Math.abs(n)<.05?0:n;$('tps').textContent=curTps.toFixed(1);$('arc').setAttribute('stroke-dasharray',Math.min(100,curTps)+' 100')}
  requestAnimationFrame(frame)}
-document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();secOut=0;requestAnimationFrame(frame)}});   // drop tokens counted while hidden from the sparkline bucket; the gauge window is wall-clock, so it shows the real current rate
+document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();secOut=0;requestAnimationFrame(frame);if(mascotOn){const p=$('mascotVid').play();p&&p.catch(()=>{})}}else if(mascotOn)$('mascotVid').pause()});   // drop tokens counted while hidden from the sparkline bucket; the gauge window is wall-clock, so it shows the real current rate. Pause the mascot while the tab is hidden; resume the same frame.
 setInterval(()=>{if(!streams.length&&!document.hidden)$('idle').textContent=IDLE[idleI++%IDLE.length]},20000);
 setInterval(()=>{if(!document.hidden)refreshNow()},60000);   // keeps runtime chips and "last seen" honest when idle
 // SSE with 60s full-refresh fallback
 let fb=null;function connect(){const es=new EventSource('events');
  es.onopen=()=>{primed=false;$('conn').textContent='Live: extinction feed connected';$('conn').classList.remove('off');if(fb){clearTimeout(fb);fb=null}};
  es.onmessage=e=>{try{onMsg(JSON.parse(e.data))}catch(_){}};
- es.onerror=()=>{$('conn').textContent='Feed lost. Refreshing every 60s like a caveman';$('conn').classList.add('off');if(!fb)fb=setTimeout(()=>location.reload(),60000)}}
+ es.onerror=()=>{$('conn').textContent='Feed lost. Refreshing every 60s like a caveman';$('conn').classList.add('off');mascotIdle(true);if(!fb)fb=setTimeout(()=>location.reload(),60000)}}
 if(window.EventSource)connect();else setTimeout(()=>location.reload(),60000);
 // Update: one check when the page opens, and again only if you click Update. Nothing polls GitHub after that.
 let UPD=null,updMode='ask',boot0=D.boot;
