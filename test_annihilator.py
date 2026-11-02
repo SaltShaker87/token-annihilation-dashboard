@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stdlib checks for the Ollama, vLLM and llama.cpp token counting. Run: python3 test_annihilator.py"""
-import http.client, http.server, json, os, sqlite3, subprocess, sys, tempfile, threading, time, unittest
+import http.client, http.server, json, os, socket, sqlite3, subprocess, sys, tempfile, threading, time, unittest
 from socketserver import ThreadingMixIn
 
 os.environ.setdefault("DASH_BIND", "127.0.0.1")
@@ -252,6 +252,151 @@ class GaugeTests(unittest.TestCase):
         # tokens already streamed before the page connected must not count as a 3 s arrival (gauge overshoot on load)
         self.assertIn("de=primed?Math.max(0,e-prevEst):0;primed=true;", ta.PAGE)
         self.assertIn("es.onopen=()=>{primed=false;", ta.PAGE)
+
+
+class Hold(http.server.BaseHTTPRequestHandler):
+    """Upstream that reads the request, then waits, so a test can look at the live card mid-flight."""
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def _send(self, body):
+        body = body.encode() if isinstance(body, str) else body
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        self._send(getattr(self.server, "get_body", '{"ok":true}'))
+    def do_POST(self):
+        self.server.seen.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+        self.server.arrived.set()
+        self.server.gate.wait(4)
+        item = self.server.reply
+        if isinstance(item, list):
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
+            for part in item:
+                p = part.encode(); self.wfile.write(b"%x\r\n%s\r\n" % (len(p), p)); self.wfile.flush(); time.sleep(0.03)
+            self.wfile.write(b"0\r\n\r\n"); return
+        self._send(item)
+
+
+class InflightTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="inflight-")
+        self.saved = (ta.DB, tuple(ta.TOT), dict(ta.LIVE), list(ta.DONE), ta.LIVE_VER[0], ta._rid[0], ta.CLIENTS[0])
+        ta.DB = os.path.join(self.tmp, "s.db")
+        ta.LIVE.clear(); ta.DONE.clear(); ta.init_db()
+        self.servers, self.gate = [], threading.Event()
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        self.gate.set()
+        for s in self.servers:
+            try: s.shutdown(); s.server_close()
+            except Exception: pass
+        db, tot, live, done, ver, rid, clients = self.saved
+        ta.DB = db; ta.TOT[:] = tot; ta.LIVE.clear(); ta.LIVE.update(live); ta.DONE[:] = done
+        ta.LIVE_VER[0] = ver; ta._rid[0] = rid; ta.CLIENTS[0] = clients
+
+    def _pair(self, reply):
+        up = Server(("127.0.0.1", 0), Hold)
+        up.gate, up.arrived, up.seen, up.reply, up.get_body = self.gate, threading.Event(), [], reply, '{"models":[]}'
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        H = type("InflightProxy", (ta.Proxy,), {"UPH": "127.0.0.1", "UPP": up.server_address[1], "SRC": "vllm"})
+        px = ta.TS(("127.0.0.1", 0), H)
+        threading.Thread(target=px.serve_forever, daemon=True).start()
+        self.servers.extend((up, px))
+        return up, px
+
+    def _post(self, port, path, payload):
+        box = {}
+        def run():
+            try:
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
+                raw = json.dumps(payload).encode()
+                c.request("POST", path, body=raw, headers={"Content-Type": "application/json"})
+                r = c.getresponse(); box["res"] = (r.status, r.read()); c.close()
+            except Exception as e:
+                box["err"] = e
+        t = threading.Thread(target=run); t.start(); return t, box
+
+    def _wait_clear(self):
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if not ta.live_state()[0]: return True
+            time.sleep(0.02)
+        return False
+
+    def test_nonstream_is_on_the_card_until_the_exact_counts_land(self):
+        self.assertIn("s.wait?'waiting for the full answer...'", ta.PAGE)
+        answer = '{"model":"quiet","usage":{"prompt_tokens":5,"completion_tokens":7}}'
+        up, px = self._pair(answer)
+        t, box = self._post(px.server_address[1], "/v1/chat/completions", {"model": "quiet", "stream": False})
+        self.assertTrue(up.arrived.wait(3))
+        streams, _ = ta.live_state()
+        self.assertEqual([(s["model"], s["endpoint"], s["wait"], s["out_est"]) for s in streams], [("quiet", "/v1/chat/completions", True, 0)])
+        self.gate.set(); t.join(5)
+        self.assertNotIn("err", box); self.assertEqual(box["res"], (200, answer.encode()))
+        self.assertTrue(self._wait_clear())
+        row = sqlite3.connect(ta.DB).execute("SELECT source, model, input_tokens, output_tokens FROM requests").fetchone()
+        self.assertEqual(row, ("vllm", "quiet", 5, 7))
+
+    def test_openai_request_without_stream_is_in_flight_immediately(self):
+        answer = '{"model":"plain","usage":{"prompt_tokens":1,"completion_tokens":2}}'
+        up, px = self._pair(answer)
+        t, box = self._post(px.server_address[1], "/v1/chat/completions", {"model": "plain"})
+        self.assertTrue(up.arrived.wait(3))
+        streams, _ = ta.live_state()
+        self.assertEqual(len(streams), 1); self.assertTrue(streams[0]["wait"]); self.assertEqual(streams[0]["model"], "plain")
+        self.gate.set(); t.join(5)
+        self.assertEqual(box["res"][0], 200)
+        self.assertTrue(self._wait_clear())
+
+    def test_ollama_default_stays_quiet_until_the_answer_starts(self):
+        # Ollama streams unless the client says stream:false, so a plain /api/chat is not shown early.
+        answer = '{"model":"llama3","done":true,"prompt_eval_count":4,"eval_count":6,"eval_duration":1000000000}'
+        up, px = self._pair(answer)
+        t, box = self._post(px.server_address[1], "/api/chat", {"model": "llama3"})
+        self.assertTrue(up.arrived.wait(3))
+        self.assertEqual(ta.live_state()[0], [])
+        self.gate.set(); t.join(5)
+        self.assertEqual(box["res"][0], 200)
+        self.assertTrue(self._wait_clear())
+        row = sqlite3.connect(ta.DB).execute("SELECT model, input_tokens, output_tokens FROM requests").fetchone()
+        self.assertEqual(row, ("llama3", 4, 6))
+
+    def test_stream_is_registered_the_old_way_and_chunks_count(self):
+        ta.CLIENTS[0] = 1   # the live estimate only ticks while someone is watching the card
+        parts = ['data: {"model":"streamy","choices":[{"delta":{"content":"a"}}]}\n\n'] * 8
+        parts += ['data: {"model":"streamy","usage":{"prompt_tokens":3,"completion_tokens":4}}\n\n', 'data: [DONE]\n\n']
+        up, px = self._pair(parts)
+        t, box = self._post(px.server_address[1], "/v1/chat/completions", {"model": "streamy", "stream": True})
+        self.assertTrue(up.arrived.wait(3))
+        self.assertEqual(ta.live_state()[0], [])   # still hidden until the upstream starts answering
+        self.gate.set()
+        seen = None; deadline = time.time() + 2
+        while time.time() < deadline:
+            streams, _ = ta.live_state()
+            if streams and streams[0]["out_est"] > 0:
+                seen = streams[0]; break
+            time.sleep(0.02)
+        self.assertIsNotNone(seen)
+        self.assertFalse(seen["wait"]); self.assertEqual(seen["model"], "streamy"); self.assertGreater(seen["out_est"], 0)
+        t.join(5)
+        self.assertEqual(box["res"][0], 200); self.assertIn(b"[DONE]", box["res"][1])
+        self.assertTrue(self._wait_clear())
+
+    def test_dead_upstream_does_not_leave_the_card_stuck(self):
+        sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
+        H = type("DeadProxy", (ta.Proxy,), {"UPH": "127.0.0.1", "UPP": port, "SRC": "vllm"})
+        px = ta.TS(("127.0.0.1", 0), H)
+        threading.Thread(target=px.serve_forever, daemon=True).start(); self.servers.append(px)
+        st, _ = req(px.server_address[1], "POST", "/v1/chat/completions", {"model": "gone", "stream": False})
+        self.assertEqual(st, 502)
+        self.assertEqual(ta.live_state()[0], [])
+
+    def test_get_passthrough_is_not_a_live_request(self):
+        up, px = self._pair('{"ok":true}')
+        st, body = req(px.server_address[1], "GET", "/api/tags")
+        self.assertEqual((st, body), (200, b'{"models":[]}'))
+        self.assertEqual(ta.live_state()[0], [])
+
 
 def read_text(path):
     with open(path, encoding="utf-8") as f:

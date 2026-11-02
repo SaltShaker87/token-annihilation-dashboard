@@ -162,13 +162,24 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         up = http.client.HTTPConnection(self.UPH, self.UPP, timeout=3600)
         hdrs = {k: v for k, v in self.headers.items() if k.lower() not in HOP and k.lower() != "content-length"}
         if body is not None: hdrs["Content-Length"] = str(len(body))
+        path = self.path.split("?")[0]
+        track = self.command == "POST" and path in TRACK
+        rid = None
+        if track:   # non-streamed: nothing arrives until the answer is done, so show it as in flight from the start
+            try:
+                j = json.loads(body or b"{}")
+                if j.get("stream") is False or (j.get("stream") is None and not path.startswith("/api/")):
+                    with LIVE_LOCK:
+                        _rid[0] += 1; rid = _rid[0]
+                        LIVE[rid] = {"model": j.get("model"), "endpoint": path, "out_est": 0, "t0": t0, "src": self.SRC, "wait": True}; live_bump()
+            except Exception: rid = None
         try:
             up.request(self.command, self.path, body=body, headers=hdrs)
             r = up.getresponse()
         except Exception as e:
+            if rid is not None:
+                with LIVE_LOCK: LIVE.pop(rid, None); live_bump()
             self.send_error(502, "upstream error: %s" % e); return
-        path = self.path.split("?")[0]
-        track = self.command == "POST" and path in TRACK
         self.send_response(r.status, r.reason)
         chunked = r.getheader("Content-Length") is None and self.command != "HEAD" and r.status not in (204, 304)
         for k, v in r.getheaders():
@@ -176,7 +187,6 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         if chunked: self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         tail = bytearray()
-        rid = None
         src = self.SRC
         streamed, t_first, t_last, nchunks = False, None, None, 0
         if track:
@@ -184,10 +194,11 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 m = None
                 try: j = json.loads(body or b"{}"); m = j.get("model"); streamed = j.get("stream") is True
                 except Exception: pass
-                with LIVE_LOCK:
-                    _rid[0] += 1; rid = _rid[0]
-                    LIVE[rid] = {"model": m, "endpoint": path, "out_est": 0, "t0": t0, "src": src}; live_bump()
-            except Exception: rid = None
+                if rid is None:
+                    with LIVE_LOCK:
+                        _rid[0] += 1; rid = _rid[0]
+                        LIVE[rid] = {"model": m, "endpoint": path, "out_est": 0, "t0": t0, "src": src}; live_bump()
+            except Exception: pass
         try:
             while True:
                 chunk = r.read1(65536) if self.command != "HEAD" else b""
@@ -461,7 +472,7 @@ def live_state():
     now = time.time()
     with LIVE_LOCK:
         streams = [{"id": k, "model": v["model"], "endpoint": v["endpoint"], "out_est": v["out_est"], "elapsed": round(now - v["t0"], 1),
-                    "src": SOURCE_LABELS.get(v.get("src"), v.get("src"))} for k, v in LIVE.items()]
+                    "src": SOURCE_LABELS.get(v.get("src"), v.get("src")), "wait": v.get("wait", False)} for k, v in LIVE.items()]
         done = [(v, dict(x, src=SOURCE_LABELS.get(x.get("src"), x.get("src")))) for v, x in DONE]
     return streams, done
 
@@ -796,7 +807,7 @@ function onMsg(m){streams=m.streams||[];
  if(m.done&&m.done.length){tables();renderTrip();nextMilestone();refreshSoon();if(T.t>mx){mx=T.t;paint()}}
  const e=streams.reduce((a,s)=>a+s.out_est,0),de=primed?Math.max(0,e-prevEst):0;primed=true;secOut+=de;   // the first message carries every token the open streams produced BEFORE this page connected; counting it as a 3 s arrival spiked the gauge (80 then settling at 30)
  if(de)arr.push([performance.now(),de]);prevEst=streams.length?e:0;est=e;
- if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent='~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
+ if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent=s.wait?'waiting for the full answer...':'~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
  draw()}
 function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
  if(!matchMedia('(prefers-reduced-motion: reduce)').matches&&!document.hidden){const c=$('now'),p=$('pulse');p.classList.remove('go');void p.offsetWidth;p.classList.add('go');for(let i=0;i<14;i++){const s=document.createElement('i');s.className='spark';const a=i/14*6.28;s.style.left='85%';s.style.top='50%';s.style.setProperty('--dx',Math.cos(a)*60+'px');s.style.setProperty('--dy',Math.sin(a)*40+'px');c.appendChild(s);setTimeout(()=>s.remove(),850)}}}
