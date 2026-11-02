@@ -575,10 +575,10 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;ma
 .muted{color:#6b7285;font-size:12px}.card{background:#14171d;border:1px solid #232833;border-radius:14px;padding:14px;position:relative;overflow:hidden}
 .row{display:grid;gap:14px;margin-top:14px}.r1{grid-template-columns:1.6fr 1fr 1fr;align-items:stretch}.r2{grid-template-columns:1.6fr 2fr}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
-.odo{--dw:36px;--dh:58px;display:flex;align-items:center;gap:3px;font:700 calc(var(--dh)*.93)/1 ui-monospace,Menlo,monospace;color:var(--g);margin:6px 0;max-width:100%}
+.odo{--dw:36px;--dh:58px;display:flex;align-items:center;gap:3px;font:700 calc(var(--dh)*.93)/1 ui-monospace,Menlo,monospace;color:var(--g);margin:6px 0;max-width:100%;overflow:hidden}
 .dig{height:var(--dh);width:var(--dw);flex:none;overflow:hidden;background:#0b0d10;border-radius:6px;border:1px solid #1f232d}.dig div{transition:transform .35s cubic-bezier(.2,.8,.2,1)}.dig span{display:block;height:var(--dh);line-height:var(--dh);text-align:center}
 .sep{width:calc(var(--dw)/3);flex:none;height:var(--dh);display:flex;align-items:flex-end;justify-content:center;padding-bottom:calc(var(--dh)/10);font-size:calc(var(--dh)*.69);line-height:1;color:#3f7a00}
-.unit{flex:none;margin-left:8px;font:800 13px system-ui,sans-serif;letter-spacing:.08em;color:#0b0d10;background:var(--g);border-radius:6px;padding:4px 7px}.words{color:#9fd14a;font-size:13px;font-weight:600}
+.x10{flex:none;margin-left:calc(var(--dw)/3);white-space:nowrap;font-size:calc(var(--dh)*.6)}.x10 sup{font-size:.6em;vertical-align:.9em;margin-left:2px}.odo.sci .dig:last-of-type{box-shadow:0 0 0 1px #3f7a00}.dig.tick{animation:tick .5s}@keyframes tick{0%{box-shadow:0 0 8px 2px var(--g)}100%{box-shadow:0 0 0 1px #3f7a00}}.words{color:#9fd14a;font-size:13px;font-weight:600}
 .scroll{max-height:380px;overflow:auto;border-radius:10px;scrollbar-color:#2f4a10 #0b0d10}.scroll .muted td{position:sticky;top:0;background:#14171d;z-index:1}#ledger{max-height:420px}#ledger .muted td{background:#0b0d10}
 .rts{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;margin-left:auto}.chip.down{border-style:dashed;color:#6b7285;border-color:#2a2f3a;background:none}.chip.busy{color:#ffb84d;border-color:#6b4a00;background:#2a1d00}
 #shareDlg{max-width:min(92vw,820px)}#shareDlg img{display:block;width:100%;border-radius:10px;border:1px solid #2f4a10;margin:10px 0 14px}.dacts{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
@@ -668,21 +668,33 @@ const $=id=>document.getElementById(id),fmt=n=>Math.round(n||0).toLocaleString('
 const IDLE=["The GPU is napping. Somewhere, a cloud invoice sleeps uneasily.","Idle. Sharpening the tensor cores.","No tokens in sight. The silence is deafening (and free).","Waiting for prey. Feed me a prompt on port "+D.port+".","Plotting the next mass extinction event.","Resting between purges. The vocabulary trembles.","Dormant. Ancient token lineages enjoy a brief reprieve."];
 let tin=D.tin,tout=D.tout,nreq=D.nreq,evOut=D.ev_out,evS=D.ev_s,est=0,streams=[],idleI=0;
 $('sub').textContent="Every token erased here is a token the cloud will never bill you for. Total eradication, locally sourced.";
-// odometer: grows a reel whenever the count gains a digit (min 9 reels, no spare leading zero), shrinks the reels to fit
-// the card, and once even 18px reels won't fit it rolls in thousands/millions/... with a unit badge.
-const ODO=$('odo'),UNITS=['','THOUSAND','MILLION','BILLION','TRILLION','QUADRILLION'];let DIG=0,SC=0,DH=58,reels=[],odoN=0;
+// odometer: one reel per digit of the shown number (no leading-zero padding, rebuilt whenever the digit count changes,
+// up or down, e.g. on a range switch). Reels shrink to fit the card down to ODO_MIN px; from 1e13 (14 digits) up, or when even the
+// smallest reels won't fit, it switches to scientific notation (d.ddd × 10^e) whose mantissa reels keep rolling.
+const ODO=$('odo'),ODO_MIN=16,ODO_MAX=36,SCI_AT=14;let DIG=0,SCI=0,EXP=0,DH=58,reels=[],odoN=0;
 const odoW=(dig,dw)=>dig*(dw+5)+Math.floor((dig-1)/3)*(dw/3+3);   // reel width + border + gap, plus the comma columns
-const odoDw=(dig,avail)=>(avail-odoW(dig,0))/(odoW(dig,1)-odoW(dig,0));   // widest reel that fits
-function odoBuild(dig,sc){DIG=dig;SC=sc;ODO.innerHTML=Array.from({length:dig},(_,i)=>(i&&(dig-i)%3==0?'<span class=sep>,</span>':'')+'<div class=dig><div>'+[...'0123456789'].map(d=>'<span>'+d+'</span>').join('')+'</div></div>').join('')+(sc?`<span class=unit>${UNITS[sc]}</span>`:'');reels=[...ODO.querySelectorAll('.dig>div')]}
-function odoFit(n){const avail=ODO.parentElement.clientWidth-30||560;let sc=0,dig;
- for(;;sc++){dig=Math.max(9-3*sc,String(Math.floor(n/1e3**sc)).length);if(odoW(dig,18)+(sc?110:0)<=avail||sc>=UNITS.length-1)break}
- const dw=Math.max(18,Math.min(36,Math.floor(odoDw(dig,avail-(sc?110:0)))));DH=Math.round(dw*1.6);ODO.style.setProperty('--dw',dw+'px');ODO.style.setProperty('--dh',DH+'px');
- if(dig!=DIG||sc!=SC)odoBuild(dig,sc)}
+const sciW=dw=>4*(dw+5)+dw/3+3+dw*3.2+dw*1.4;   // 4 mantissa reels + point + "× 10" + exponent
+const nDig=n=>String(Math.max(0,Math.floor(n))).length;
+function odoBuild(dig,sci,exp){DIG=dig;SCI=sci;EXP=exp;
+ const reel='<div class=dig><div>'+[...'0123456789'].map(d=>'<span>'+d+'</span>').join('')+'</div></div>';
+ ODO.classList.toggle('sci',!!sci);
+ ODO.innerHTML=sci?reel+'<span class=sep>.</span>'+reel+reel+reel+`<span class=x10>×&nbsp;10<sup>${exp}</sup></span>`
+  :Array.from({length:dig},(_,i)=>(i&&(dig-i)%3==0?'<span class=sep>,</span>':'')+reel).join('');
+ reels=[...ODO.querySelectorAll('.dig>div')]}
+function odoFit(n){const avail=(ODO.parentElement.clientWidth-30)||560,dig=nDig(n);
+ const fitDw=w=>Math.floor((avail-odoW(dig,0))/(odoW(dig,1)-odoW(dig,0)));
+ let sci=dig>=SCI_AT||fitDw()<ODO_MIN,dw;
+ if(sci)dw=Math.max(ODO_MIN,Math.min(ODO_MAX,Math.floor((avail-sciW(0))/(sciW(1)-sciW(0)))));else dw=Math.min(ODO_MAX,fitDw());
+ DH=Math.round(dw*1.6);ODO.style.setProperty('--dw',dw+'px');ODO.style.setProperty('--dh',DH+'px');
+ const exp=sci?dig-1:0;if(dig!=DIG||+sci!=SCI||exp!=EXP||!reels.length)odoBuild(dig,+sci,exp)}
+function odoDigits(n){   // the digits the reels show: all of them, or the 4 mantissa digits (truncated, so it never shows more than counted)
+ const s=String(Math.max(0,Math.floor(n)));return SCI?s.slice(0,4).padEnd(4,'0'):s}
 const WORD=[[1e15,'quadrillion'],[1e12,'trillion'],[1e9,'billion'],[1e6,'million'],[1e3,'thousand']];
 function words(n){for(const [v,w] of WORD)if(n>=v)return '≈ '+(n/v).toLocaleString('en-US',{maximumFractionDigits:n/v<10?2:1})+' '+w+' tokens';return ''}
-function setOdo(n){n=Math.floor(n);odoN=n;if(String(Math.floor(n/1e3**SC)).length>DIG||!DIG)odoFit(n);
- const s=String(Math.floor(n/1e3**SC)).padStart(DIG,'0').slice(-DIG);reels.forEach((r,i)=>r.style.transform=`translateY(${-DH*s[i]}px)`);
- $('odoWords').textContent=words(n);ODO.title=fmt(n)+' tokens'}
+function setOdo(n){n=Math.max(0,Math.floor(n));const prev=odoN;odoN=n;if(nDig(n)!=DIG||!reels.length)odoFit(n);
+ const s=odoDigits(n);reels.forEach((r,i)=>r.style.transform=`translateY(${-DH*s[i]}px)`);
+ if(SCI&&n!=prev&&reels.length){const l=reels[reels.length-1].parentElement;l.classList.remove('tick');void l.offsetWidth;l.classList.add('tick')}
+ $('odoWords').textContent=SCI?fmt(n)+' tokens ('+words(n).slice(2)+')':words(n);ODO.title=fmt(n)+' tokens'}
 if(window.ResizeObserver)new ResizeObserver(()=>{if(DIG){odoFit(odoN);setOdo(odoN)}}).observe($('odoCard'));
 // calendar
 const shades=["#1b1f27","#2a4d0a","#3f7a00","#5a9e00","#76B900"];$('leg').innerHTML=shades.map(s=>`<span class=sw style="background:${s}"></span>`).join('');
