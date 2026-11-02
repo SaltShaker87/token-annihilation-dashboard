@@ -56,6 +56,43 @@ systemctl --user enable --now token-annihilator
 loginctl enable-linger "$USER"   # keep running after logout
 ```
 
+## Updates
+
+The bottom of the dashboard has an **Update** button and a small hint: **up to date**, **update available**, or **no release found**. Opening the page checks once. Nothing keeps asking GitHub in the background.
+
+**No release found** is normal until the first release is published. The button tells you the installed version and does not change any files.
+
+When a newer release exists, the button shows the version you have next to the latest one and asks you to confirm. Only after that does it:
+
+- stop, and name the files, if the install folder has uncommitted edits (it will not overwrite them)
+- stop if you have local commits that the release does not already contain
+- download that release's git tag from the official repo only (`github.com/SaltShaker87/token-annihilation-dashboard`). A version, link, or branch sent by the browser is ignored. There is no setting to point this at another URL
+- keep the previous checkout under `refs/backup/token-annihilator-prev` and put it back if the new files do not match the release
+- restart the `token-annihilator` user service. If you started the dashboard by hand instead of systemd, it leaves the new files in place and tells you to restart it yourself
+
+Your stats database stays. Ollama, llama.cpp, vLLM, their ports, and any other service are not restarted or reconfigured.
+
+To undo an update that will not start:
+
+```bash
+cd ~/token-annihilation-dashboard
+git checkout --detach refs/backup/token-annihilator-prev
+systemctl --user restart token-annihilator
+```
+
+### Versioning and cutting a release
+
+The version is the `VERSION` file in the repo root: three numbers and nothing else, such as `1.2.0`. This copy ships as `0.0.0`, which means no release has been cut yet. The git tag for a release is `v` plus the same number (`v1.2.0`), and the `VERSION` file on that tag has to say the same thing. The running dashboard reads `VERSION`. It finds the latest release with the public GitHub API, which needs no token. Drafts and pre-releases are ignored, and a tag on its own is not enough: the API only sees a published GitHub Release.
+
+```bash
+# on main: set VERSION to the new number, commit, tag, and push
+git add VERSION && git commit -m "v1.2.0"
+git tag v1.2.0
+git push origin main --tags
+```
+
+On GitHub: Releases → Draft a new release → choose the tag `v1.2.0` → Publish release. Open the dashboard and the hint changes to **update available**.
+
 ## Backend setup
 
 ### Ollama

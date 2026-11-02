@@ -2,7 +2,7 @@
 """Token Annihilation Dashboard: transparent token-counting proxies (Ollama, vLLM, llama.cpp / any
 OpenAI-compatible server) + llama.cpp log tailing + a tiny, gloriously dramatic dashboard. Stdlib only.
 MIT licensed. https://github.com/SaltShaker87/token-annihilation-dashboard"""
-import http.client, http.server, json, os, re, sqlite3, subprocess, sys, threading, time, html
+import ast, http.client, http.server, json, os, re, sqlite3, subprocess, sys, threading, time, html, urllib.error, urllib.request
 from datetime import datetime
 from socketserver import ThreadingMixIn
 
@@ -162,13 +162,24 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         up = http.client.HTTPConnection(self.UPH, self.UPP, timeout=3600)
         hdrs = {k: v for k, v in self.headers.items() if k.lower() not in HOP and k.lower() != "content-length"}
         if body is not None: hdrs["Content-Length"] = str(len(body))
+        path = self.path.split("?")[0]
+        track = self.command == "POST" and path in TRACK
+        rid = None
+        if track:   # non-streamed: nothing arrives until the answer is done, so show it as in flight from the start
+            try:
+                j = json.loads(body or b"{}")
+                if j.get("stream") is False or (j.get("stream") is None and not path.startswith("/api/")):
+                    with LIVE_LOCK:
+                        _rid[0] += 1; rid = _rid[0]
+                        LIVE[rid] = {"model": j.get("model"), "endpoint": path, "out_est": 0, "t0": t0, "src": self.SRC, "wait": True}; live_bump()
+            except Exception: rid = None
         try:
             up.request(self.command, self.path, body=body, headers=hdrs)
             r = up.getresponse()
         except Exception as e:
+            if rid is not None:
+                with LIVE_LOCK: LIVE.pop(rid, None); live_bump()
             self.send_error(502, "upstream error: %s" % e); return
-        path = self.path.split("?")[0]
-        track = self.command == "POST" and path in TRACK
         self.send_response(r.status, r.reason)
         chunked = r.getheader("Content-Length") is None and self.command != "HEAD" and r.status not in (204, 304)
         for k, v in r.getheaders():
@@ -176,7 +187,6 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         if chunked: self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         tail = bytearray()
-        rid = None
         src = self.SRC
         streamed, t_first, t_last, nchunks = False, None, None, 0
         if track:
@@ -184,10 +194,11 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 m = None
                 try: j = json.loads(body or b"{}"); m = j.get("model"); streamed = j.get("stream") is True
                 except Exception: pass
-                with LIVE_LOCK:
-                    _rid[0] += 1; rid = _rid[0]
-                    LIVE[rid] = {"model": m, "endpoint": path, "out_est": 0, "t0": t0, "src": src}; live_bump()
-            except Exception: rid = None
+                if rid is None:
+                    with LIVE_LOCK:
+                        _rid[0] += 1; rid = _rid[0]
+                        LIVE[rid] = {"model": m, "endpoint": path, "out_est": 0, "t0": t0, "src": src}; live_bump()
+            except Exception: pass
         try:
             while True:
                 chunk = r.read1(65536) if self.command != "HEAD" else b""
@@ -433,7 +444,7 @@ def page_data():
     try: prices = [p for p in json.load(open(PRICES))["models"]]
     except Exception: prices = []
     return {"tin": tin, "tout": tout, "nreq": nreq, "ev_out": ev[0], "ev_s": ev[1], "days": days, "prices": prices,
-            "today": datetime.now().strftime("%Y-%m-%d"), "port": PROXY_PORT, "st": st}
+            "today": datetime.now().strftime("%Y-%m-%d"), "port": PROXY_PORT, "st": st, "version": read_version(), "boot": BOOT_ID}
 
 def api_stats(since=None):
     c = db()
@@ -461,7 +472,7 @@ def live_state():
     now = time.time()
     with LIVE_LOCK:
         streams = [{"id": k, "model": v["model"], "endpoint": v["endpoint"], "out_est": v["out_est"], "elapsed": round(now - v["t0"], 1),
-                    "src": SOURCE_LABELS.get(v.get("src"), v.get("src"))} for k, v in LIVE.items()]
+                    "src": SOURCE_LABELS.get(v.get("src"), v.get("src")), "wait": v.get("wait", False)} for k, v in LIVE.items()]
         done = [(v, dict(x, src=SOURCE_LABELS.get(x.get("src"), x.get("src")))) for v, x in DONE]
     return streams, done
 
@@ -478,6 +489,12 @@ class Dash(http.server.BaseHTTPRequestHandler):
             try: days = int(qs.get("days", 0))
             except ValueError: days = 0
             return self.json(api_stats(time.time() - days * 86400 if days > 0 else None))
+        if p == "/api/update":
+            try: return self.json(update_status())
+            except Exception as e:
+                print("update check error:", e, file=sys.stderr, flush=True)
+                return self.json({"ok": False, "state": "error", "boot": BOOT_ID, "current": read_version() or None,
+                                   "latest": None, "tag": None, "dirty": [], "message": "Could not check for an update."})
         if p.startswith("/static/"):
             name = os.path.basename(p)
             ct = STATIC_TYPES.get(os.path.splitext(name)[1])
@@ -498,6 +515,8 @@ class Dash(http.server.BaseHTTPRequestHandler):
     def json(self, obj, code=200):
         b = json.dumps(obj).encode()
         self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        try: self.wfile.flush()
+        except Exception: pass
     def do_POST(self):
         p = self.path.split("?")[0]
         n = min(int(self.headers.get("Content-Length") or 0), 8192)
@@ -507,6 +526,14 @@ class Dash(http.server.BaseHTTPRequestHandler):
         try:
             if p == "/api/trip/reset": trip_reset(body.get("name")); return self.json(api_stats())
             if p == "/api/milestones/ack": ms_ack(body.get("keys")); return self.json({"ok": True})
+            if p == "/api/update":
+                code, res = begin_update(body, self.headers)
+                self.json(res, code)
+                # Answer first. A systemd restart tears this process down a moment later.
+                if code == 200 and res.get("ok") and res.get("restart") == "systemd":
+                    try: schedule_restart()
+                    except Exception as e: print("restart failed:", e, file=sys.stderr, flush=True)
+                return
         except Exception as e: return self.json({"error": str(e)}, 500)
         self.json({"error": "not found"}, 404)
     def events(self):
@@ -595,6 +622,9 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 .fbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap}.fbar .muted{margin-top:14px}
 .msvid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.45;pointer-events:none}.msshade{position:absolute;inset:0;background:radial-gradient(circle at 50% 50%,rgba(0,0,0,.25),rgba(0,0,0,.85));pointer-events:none}
 .tiny{background:none;border:none;color:#3f4757;font-size:11px;cursor:pointer}
+.btn:disabled{opacity:.55;cursor:wait}.upd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:6px 0 12px}
+.hint-ok{color:#9fd14a;font-size:12px}.hint-new{color:var(--g);font-weight:700;font-size:12px}
+#updDlg{max-width:480px}#updBody{white-space:pre-wrap;line-height:1.45}
 @media (max-width:900px){.r3{grid-template-columns:1fr}}
 @media (max-width:900px){.r1,.r2,.two{grid-template-columns:1fr}}
 .seg{max-width:100%;overflow-x:auto}.seg button{white-space:nowrap}
@@ -629,6 +659,8 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 <dialog id=shareDlg><b style="color:var(--g)">Your carnage, ready to share</b><img id=shareImg alt="Share card: tokens obliterated, cloud invoices eradicated and trophies"><div class=dacts><button class=btn id=shareNative hidden>📤 Share</button><button class=btn id=shareCopy hidden>📋 Copy image</button><button class=btn id=shareDl>⬇ Download PNG</button><button class=btn id=shareX>Close</button></div><div class=muted id=shareMsg style="margin-top:8px;text-align:right"></div></dialog>
 <div class=ms id=ms hidden><video class=msvid id=msVid muted loop playsinline preload=none poster="static/icon-180.png"><source src="static/splash.mp4" type="video/mp4"></video><div class=msshade></div><canvas id=conf></canvas><div id=orbs></div><div class=msbox><img src="static/icon.webp" class=msg alt=""><div class=mskick id=msKick></div><div class=msbig id=msBig></div><div class=mssub id=msSub></div><button class=btn id=msX>Bask in glory (dismiss)</button></div></div>
 <p class=muted>No GPUs were harmed. Entire bloodlines of cloud invoices were. <button class=tiny id=msTest title="Preview the 1 billion celebration (does not count)">🎉 test the party</button></p>
+<div class=upd><button class=btn id=updBtn title="Check the official GitHub releases and install a newer one">Update</button><span class=muted id=updHint>checking for updates…</span></div>
+<dialog id=updDlg><form method=dialog><b style="color:var(--g)" id=updTitle>Dashboard update</b><div id=updBody style="margin-top:8px"></div><div class=dacts style="margin-top:14px"><button class=btn value=cancel>Close</button><button class=btn id=updGo value=ok hidden>Install</button></div></form></dialog>
 <div id=tip></div>
 <script>
 const D=__DATA__;
@@ -775,7 +807,7 @@ function onMsg(m){streams=m.streams||[];
  if(m.done&&m.done.length){tables();renderTrip();nextMilestone();refreshSoon();if(T.t>mx){mx=T.t;paint()}}
  const e=streams.reduce((a,s)=>a+s.out_est,0),de=primed?Math.max(0,e-prevEst):0;primed=true;secOut+=de;   // the first message carries every token the open streams produced BEFORE this page connected; counting it as a 3 s arrival spiked the gauge (80 then settling at 30)
  if(de)arr.push([performance.now(),de]);prevEst=streams.length?e:0;est=e;
- if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent='~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
+ if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent=s.wait?'waiting for the full answer...':'~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
  draw()}
 function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
  if(!matchMedia('(prefers-reduced-motion: reduce)').matches&&!document.hidden){const c=$('now'),p=$('pulse');p.classList.remove('go');void p.offsetWidth;p.classList.add('go');for(let i=0;i<14;i++){const s=document.createElement('i');s.className='spark';const a=i/14*6.28;s.style.left='85%';s.style.top='50%';s.style.setProperty('--dx',Math.cos(a)*60+'px');s.style.setProperty('--dy',Math.sin(a)*40+'px');c.appendChild(s);setTimeout(()=>s.remove(),850)}}}
@@ -808,6 +840,43 @@ let fb=null;function connect(){const es=new EventSource('events');
  es.onmessage=e=>{try{onMsg(JSON.parse(e.data))}catch(_){}};
  es.onerror=()=>{$('conn').textContent='Feed lost. Refreshing every 60s like a caveman';$('conn').classList.add('off');if(!fb)fb=setTimeout(()=>location.reload(),60000)}}
 if(window.EventSource)connect();else setTimeout(()=>location.reload(),60000);
+// Update: one check when the page opens, and again only if you click Update. Nothing polls GitHub after that.
+let UPD=null,updMode='ask',boot0=D.boot;
+function ss(op,k,v){try{return sessionStorage[op].call(sessionStorage,k,v)}catch(_){return null}}
+function paintUpd(){const h=$('updHint'),u=UPD||{},just=ss('getItem','tad.updated');
+ if(u.state=='up_to_date'){if(just)ss('removeItem','tad.updated');h.className='hint-ok';h.textContent=(just&&just===u.current?'updated · ':'')+'up to date'+(u.current?' · v'+u.current:'')}
+ else if(u.state=='update_available'){h.className='hint-new';h.textContent='update available'+(u.dirty&&u.dirty.length?' · local edits':' · v'+u.latest)}
+ else if(u.state=='no_release'){h.className='muted';h.textContent='no release found'+(u.current?' · v'+u.current:'')}
+ else{h.className='muted';h.textContent='could not check for updates'}}
+async function checkUpd(){try{UPD=await(await fetch('api/update',{cache:'no-store'})).json()}catch(_){UPD={state:'error',message:'Could not reach the dashboard.'}}paintUpd()}
+function updText(u){
+ if(u.state=='no_release')return 'No release found'+(u.current?' (this install is v'+u.current+')':'')+'. Nothing changes until a release is published on GitHub.';
+ if(u.state=='up_to_date')return u.message||'This install is already on the latest release.';
+ if(u.state=='update_available'&&u.dirty&&u.dirty.length)return 'v'+u.latest+' is available'+(u.current?' (you have v'+u.current+')':'')+', but this install has local edits, so nothing will be overwritten: '+u.dirty.join(', ');
+ if(u.state=='update_available')return `Current version: ${u.current?'v'+u.current:'unknown'}
+Latest release: v${u.latest}
+
+Install that release? Only this dashboard is updated. Your saved stats stay. Ollama, llama.cpp and vLLM are left alone.`;
+ return u.message||'Could not check for updates.'}
+async function waitBoot(){for(let i=0;i<40;i++){await new Promise(r=>setTimeout(r,1000));try{const s=await(await fetch('api/update',{cache:'no-store'})).json();if(s.boot&&s.boot!==boot0){location.reload();return true}}catch(_){}}return false}
+$('updBtn').onclick=async()=>{
+ $('updBtn').disabled=true;await checkUpd();$('updBtn').disabled=false;const u=UPD||{};updMode='ask';
+ const go=u.state=='update_available'&&!(u.dirty&&u.dirty.length);
+ $('updTitle').textContent=go?'Install v'+u.latest+'?':'Dashboard update';$('updBody').textContent=updText(u);
+ $('updGo').hidden=!go;if(go)$('updGo').textContent='Install v'+u.latest;$('updDlg').showModal()};
+$('updDlg').onclose=async()=>{
+ if(updMode!=='ask'||$('updDlg').returnValue!=='ok')return;
+ updMode='run';$('updGo').hidden=true;$('updBtn').disabled=true;$('updHint').className='muted';$('updHint').textContent='updating…';
+ let j=null;try{j=await(await fetch('api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})})).json()}catch(_){j=null}
+ if(j&&j.ok&&j.restart=='systemd'){if(j.version)ss('setItem','tad.updated',j.version);$('updHint').textContent='restarting the dashboard…';if(!await waitBoot())$('updHint').textContent='the new version is installed, but the dashboard did not come back. Run: systemctl --user status token-annihilator';$('updBtn').disabled=false;return}
+ if(!j){$('updHint').textContent='waiting for the dashboard…';if(await waitBoot())return;j={ok:false,message:'The update did not finish, and the dashboard never came back with a new start.'}}
+ $('updBtn').disabled=false;
+ if(j.ok)$('updHint').className='hint-new',$('updHint').textContent='updated · restart required';
+ else if(j.state=='dirty')$('updHint').textContent='update available · local edits';
+ else if(j.state=='blocked')$('updHint').textContent='not updated · local commits';
+ else $('updHint').textContent='update failed';
+ updMode='done';$('updTitle').textContent=j.ok?'Update complete':'Update stopped';$('updBody').textContent=j.message||'The update did not finish.';setTimeout(()=>$('updDlg').showModal(),0)};
+checkUpd();
 draw();requestAnimationFrame(frame);
 </script></body></html>"""
 
@@ -899,6 +968,313 @@ def llama_backfill():
     seconds of each server start in the file, for exact timestamps (else inferred from the file mtime)."""
     anchors = [float(x) for x in os.environ.get("LLAMA_STARTS", "").split(",") if x.strip()] or None
     print("llama rows logged:", llama_scan(anchors=anchors))
+
+
+# --- self-update -------------------------------------------------------------------------------
+# One official repo, one release tag, this folder only. The browser cannot choose the git URL or
+# the tag: we read the latest GitHub release ourselves and then check that same tag with git
+# ls-remote on the public repository. A failed checkout is put back from refs/backup/token-annihilator-prev.
+# Ollama, llama.cpp, vLLM and every other service are never restarted.
+OFFICIAL_REPO = "SaltShaker87/token-annihilation-dashboard"
+OFFICIAL_GIT = "https://github.com/SaltShaker87/token-annihilation-dashboard.git"
+RELEASES_URL = "https://api.github.com/repos/%s/releases/latest" % OFFICIAL_REPO
+SERVICE = "token-annihilator"
+RESTART_ARGV = ["systemctl", "--user", "restart", SERVICE]
+RESTART_DELAY = 0.6
+BOOT_ID = "%d-%d" % (os.getpid(), time.time_ns())
+TAG_OK = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+VER_OK = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+SHA_OK = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+UPDATE_LOCK = threading.Lock()
+_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+
+def ver_tuple(s):
+    m = VER_OK.match((s or "").strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+def read_version():
+    try:
+        with open(os.path.join(HOME, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+def _short(err):
+    lines = str(err).strip().splitlines()
+    return (lines[-1] if lines else "unknown error")[:240]
+
+def git_cmd(args, timeout=60):
+    """git, pinned to this install. Hooks and inherited GIT_DIR cannot point the command elsewhere."""
+    root = os.path.realpath(HOME)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    for k in _GIT_ENV_DROP:
+        env.pop(k, None)
+    return subprocess.run(["git", "-C", root, "-c", "core.hooksPath=/dev/null", *args],
+                          capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
+
+def git_ok(args, timeout=60):
+    p = git_cmd(args, timeout)
+    if p.returncode != 0:
+        raise RuntimeError(_short(p.stderr or p.stdout or "git failed"))
+    return (p.stdout or "").strip()
+
+def local_modifications():
+    p = git_cmd(["rev-parse", "--is-inside-work-tree"])
+    if p.returncode != 0 or (p.stdout or "").strip() != "true":
+        raise RuntimeError("not a git checkout")
+    p = git_cmd(["status", "--porcelain"])
+    if p.returncode != 0:
+        raise RuntimeError(_short(p.stderr or p.stdout or "git status failed"))
+    return [ln[3:].strip() for ln in (p.stdout or "").splitlines() if len(ln) >= 4]
+
+def fetch_latest():
+    """Latest published release, or None when GitHub has no release yet. Drafts and pre-releases are skipped by this API."""
+    req = urllib.request.Request(RELEASES_URL, headers={"User-Agent": "token-annihilation-dashboard", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read(65536).decode())
+    except urllib.error.HTTPError as e:
+        try:
+            if e.code == 404:
+                return None
+            raise RuntimeError("GitHub returned HTTP %s" % e.code)
+        finally:
+            e.close()
+    except Exception as e:
+        raise RuntimeError(type(e).__name__)
+    if not isinstance(data, dict):
+        raise RuntimeError("GitHub returned an unexpected response")
+    tag = str(data.get("tag_name") or "").strip()
+    # Download links and target branches in this payload are ignored on purpose.
+    if len(tag) > 48 or not TAG_OK.match(tag):
+        raise RuntimeError("latest release tag %s is not vX.Y.Z" % (tag[:40] or "empty"))
+    return {"tag": tag, "version": tag[1:]}
+
+def update_status():
+    cur = read_version()
+    out = {"ok": True, "current": cur or None, "latest": None, "tag": None, "state": "error", "boot": BOOT_ID,
+           "dirty": [], "restart": None, "message": ""}
+    try:
+        out["dirty"] = local_modifications()
+    except Exception as e:
+        out["ok"] = False
+        msg = _short(e)
+        out["message"] = "This install is not a git checkout, so it cannot update itself." if "not a git checkout" in msg else "Could not inspect the install (%s)." % msg
+        return out
+    try:
+        rel = fetch_latest()
+    except Exception as e:
+        out["ok"] = False
+        out["message"] = "Could not check GitHub for a release (%s)." % _short(e)
+        return out
+    if rel is None:
+        out["state"] = "no_release"
+        out["message"] = "No release found." + ((" This install is v%s." % cur) if cur else "")
+        return out
+    out["latest"], out["tag"] = rel["version"], rel["tag"]
+    cv, lv = ver_tuple(cur), ver_tuple(rel["version"])
+    if lv is None:
+        out["ok"] = False
+        out["message"] = "The latest release tag could not be read."
+        return out
+    if cv is not None and cv >= lv:
+        out["state"] = "up_to_date"
+        out["message"] = "v%s is the latest release." % cur if cv == lv else "v%s is newer than the latest release v%s." % (cur, rel["version"])
+        return out
+    out["state"] = "update_available"
+    out["message"] = "v%s is available (this install is %s)." % (rel["version"], "v%s" % cur if cv else "an unknown version")
+    return out
+
+def ls_remote_tag(tag):
+    p = git_cmd(["ls-remote", OFFICIAL_GIT, "refs/tags/" + tag], timeout=30)
+    if p.returncode != 0:
+        raise RuntimeError(_short(p.stderr or "could not read the official tag"))
+    want = "refs/tags/" + tag
+    for line in (p.stdout or "").splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref.strip() == want and SHA_OK.match(sha.strip()):
+            return sha.strip()
+    raise RuntimeError("official repository has no tag %s" % tag)
+
+def restore_commit(old, git_dir):
+    if not SHA_OK.match(old or ""):
+        raise RuntimeError("backup commit id is not usable")
+    err = None
+    for attempt in (1, 2):
+        try:
+            git_ok(["reset", "--hard", old], timeout=60)
+            head = git_ok(["rev-parse", "--verify", "HEAD"])
+            if head != old:
+                raise RuntimeError("restore landed on %s" % head[:12])
+            return
+        except Exception as e:
+            err = e
+            lockp = os.path.join(git_dir, "index.lock")
+            if attempt == 1 and os.path.isfile(lockp):
+                try: os.remove(lockp)
+                except OSError: pass
+                continue
+            break
+    raise RuntimeError(err)
+
+def verify_tree(version):
+    got, want = ver_tuple(read_version()), ver_tuple(version)
+    if not want or got != want:
+        raise RuntimeError("VERSION file is %s, release is %s" % (read_version() or "missing", version))
+    src = os.path.join(HOME, "token_annihilator.py")
+    if not os.path.isfile(src):
+        raise RuntimeError("token_annihilator.py is missing from the release")
+    try:
+        with open(src, encoding="utf-8") as f:
+            ast.parse(f.read())
+    except SyntaxError as e:
+        raise RuntimeError("token_annihilator.py has a syntax error on line %s" % (e.lineno or "?"))
+    except Exception as e:
+        raise RuntimeError("token_annihilator.py could not be read (%s)" % _short(e))
+
+def _apply_update():
+    if os.path.realpath(HOME) == "/":
+        return {"ok": False, "state": "error", "restart": None, "message": "Refusing to update the root folder."}
+    if not os.path.isfile(os.path.join(HOME, "token_annihilator.py")):
+        return {"ok": False, "state": "error", "restart": None, "message": "This folder has no token_annihilator.py, so it was left alone."}
+    st = update_status()
+    if st["state"] == "no_release":
+        return dict(st, ok=False, restart=None)
+    if st["state"] == "up_to_date":
+        return dict(st, ok=True, restart=None)
+    if st["state"] != "update_available":
+        return dict(st, ok=False, restart=None)
+    if st["dirty"]:
+        files = ", ".join(st["dirty"][:8]) + ("" if len(st["dirty"]) <= 8 else " (+%d more)" % (len(st["dirty"]) - 8))
+        return {"ok": False, "state": "dirty", "dirty": st["dirty"], "restart": None, "current": st["current"], "latest": st["latest"], "tag": st["tag"],
+                "message": "Not updated. This install has local edits that an update would overwrite: %s." % files}
+    tag, ver = st["tag"], st["latest"]
+    if not tag or len(tag) > 48 or not TAG_OK.match(tag):
+        return {"ok": False, "state": "error", "restart": None, "message": "Refusing an unrecognised release tag."}
+    old = git_ok(["rev-parse", "--verify", "HEAD"])
+    if not SHA_OK.match(old):
+        return {"ok": False, "state": "error", "restart": None, "message": "The current commit id could not be saved, so nothing was changed."}
+    git_dir = os.path.realpath(git_ok(["rev-parse", "--absolute-git-dir"]))
+    git_ok(["update-ref", "refs/backup/token-annihilator-prev", old])
+    try:
+        git_ok(["fetch", "--quiet", OFFICIAL_GIT, "+refs/tags/%s:refs/tags/%s" % (tag, tag)], timeout=90)
+        if git_ok(["rev-parse", "--verify", "refs/tags/" + tag]) != ls_remote_tag(tag):
+            raise RuntimeError("the downloaded tag does not match the official repository")
+        peeled = git_ok(["rev-parse", "--verify", "refs/tags/%s^{commit}" % tag])
+        if not SHA_OK.match(peeled):
+            raise RuntimeError("release commit id was not a commit")
+    except Exception as e:
+        return {"ok": False, "state": "error", "restart": None, "current": st["current"], "latest": ver, "tag": tag,
+                "message": "Update did not start (%s). The installed files were not changed." % _short(e)}
+    anc = git_cmd(["merge-base", "--is-ancestor", old, peeled])
+    if anc.returncode == 1:
+        return {"ok": False, "state": "blocked", "restart": None, "current": st["current"], "latest": ver, "tag": tag,
+                "message": "Not updated. This install has commits that are not in %s, so those commits were left as they are." % tag}
+    if anc.returncode != 0:
+        return {"ok": False, "state": "error", "restart": None, "current": st["current"], "latest": ver, "tag": tag,
+                "message": "Not updated. Could not compare this install with %s (%s)." % (tag, _short(anc.stderr or anc.stdout))}
+    if local_modifications():
+        return {"ok": False, "state": "dirty", "dirty": local_modifications(), "restart": None, "current": st["current"], "latest": ver, "tag": tag,
+                "message": "Not updated. Files changed while the release was downloading, so nothing was switched over."}
+    try:
+        git_ok(["checkout", "--detach", "--quiet", "refs/tags/" + tag])
+        if os.path.realpath(git_ok(["rev-parse", "--absolute-git-dir"])) != git_dir:
+            raise RuntimeError("git directory changed during the update")
+        verify_tree(ver)
+        if git_ok(["rev-parse", "--verify", "HEAD"]) != peeled:
+            raise RuntimeError("checkout did not land on the release")
+    except Exception as e:
+        try:
+            restore_commit(old, git_dir)
+        except Exception as e2:
+            return {"ok": False, "state": "error", "restart": None, "previous": old,
+                    "message": "Update to %s failed (%s), and putting the previous version back also failed (%s). The backup ref is refs/backup/token-annihilator-prev." % (tag, _short(e), _short(e2))}
+        return {"ok": False, "state": "error", "restart": None, "current": read_version() or None, "previous": old,
+                "message": "Could not switch to %s (%s). The previous version was put back." % (tag, _short(e))}
+    mode = restart_plan()
+    msg = "Updated to v%s." % ver
+    if mode == "systemd":
+        msg += " Restarting the dashboard."
+    else:
+        msg += " The new files are in place, but this dashboard was not started by its systemd service, so restart it yourself to load them. The usual command is: systemctl --user restart token-annihilator"
+    return {"ok": True, "state": "updated", "version": ver, "tag": tag, "previous": old, "current": ver, "restart": mode, "boot": BOOT_ID, "message": msg}
+
+def apply_update():
+    """Install the latest official release. Takes no tag and no URL; anything the browser sent is ignored."""
+    if not UPDATE_LOCK.acquire(blocking=False):
+        res = {"ok": False, "state": "error", "restart": None, "message": "An update is already running."}
+        print("update:", res["message"], flush=True)
+        return res
+    try:
+        try: res = _apply_update()
+        except Exception as e:
+            res = {"ok": False, "state": "error", "restart": None, "message": "Update failed (%s)." % _short(e)}
+    finally:
+        UPDATE_LOCK.release()
+    if res.get("state") not in ("up_to_date", "no_release"):
+        print("update:", res.get("message"), flush=True)
+    return res
+
+def origin_ok(headers):
+    """POST /api/update is accepted only from a page served by this dashboard (basic CSRF)."""
+    try:
+        origin = (headers.get("Origin") or "").strip()
+        host = (headers.get("Host") or "").strip()
+        site = headers.get("Sec-Fetch-Site")
+    except Exception:
+        return False
+    if not origin or not host or any(ord(c) < 33 for c in origin + host):
+        return False
+    scheme, sep, rest = origin.partition("://")
+    if sep != "://" or scheme not in ("http", "https") or rest != host:
+        return False
+    if site is not None and str(site).strip().lower() != "same-origin":
+        return False
+    return True
+
+def begin_update(body, headers):
+    if not origin_ok(headers):
+        print("update: rejected a request that did not come from the dashboard page", flush=True)
+        return 403, {"ok": False, "state": "forbidden", "message": "Update requests are only accepted from this dashboard page."}
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return 400, {"ok": False, "state": "confirm", "message": "Confirm the update in the dashboard before it will install a release."}
+    return 200, apply_update()
+
+def service_state(show_text, pid, invocation_id):
+    if not invocation_id:
+        return "manual"
+    info = {}
+    for line in (show_text or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k.strip()] = v.strip()
+    if info.get("ActiveState") == "active" and info.get("MainPID") == str(pid):
+        return "systemd"
+    return "manual"
+
+def restart_plan():
+    """systemd only when this process is the token-annihilator user service. Anything else is left for the operator."""
+    if not os.environ.get("INVOCATION_ID"):
+        return "manual"
+    try:
+        p = subprocess.run(["systemctl", "--user", "show", SERVICE, "-p", "MainPID", "-p", "ActiveState"],
+                           capture_output=True, text=True, errors="replace", timeout=5)
+        text = p.stdout if p.returncode == 0 else ""
+    except Exception:
+        return "manual"
+    return service_state(text, os.getpid(), os.environ.get("INVOCATION_ID"))
+
+def schedule_restart():
+    def go():
+        time.sleep(RESTART_DELAY)
+        try:
+            print("update: restarting via systemctl --user restart %s" % SERVICE, flush=True)
+            subprocess.Popen(RESTART_ARGV, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print("restart failed:", e, file=sys.stderr, flush=True)
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    return t
 
 
 class TS(ThreadingMixIn, http.server.HTTPServer): daemon_threads = True; allow_reuse_address = True
