@@ -192,6 +192,8 @@ class ProxyTests(unittest.TestCase):
         st, page = req(self.dash, "GET", "/"); self.assertEqual(st, 200); text = page.decode()
         self.assertIn('src="static/icon.webp"', text); self.assertIn("static/splash.mp4", text)
         self.assertIn("esc(x.model)", text)   # model names are HTML-escaped client-side; embedded JSON escapes "</"
+        self.assertIn("id=updBtn", text); self.assertIn(">Update</button>", text)
+        self.assertIn('"version": "0.0.0"', text); self.assertIn('"boot":', text)
         st, img = req(self.dash, "GET", "/static/icon-32.png"); self.assertTrue(img.startswith(b"\x89PNG"))
         j = json.loads(req(self.dash, "GET", "/api/stats")[1])
         labels = {s["label"]: s["tok"] for s in j["sources"]}
@@ -250,6 +252,373 @@ class GaugeTests(unittest.TestCase):
         # tokens already streamed before the page connected must not count as a 3 s arrival (gauge overshoot on load)
         self.assertIn("de=primed?Math.max(0,e-prevEst):0;primed=true;", ta.PAGE)
         self.assertIn("es.onopen=()=>{primed=false;", ta.PAGE)
+
+def read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def git(cwd, *args):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="Test",
+               GIT_COMMITTER_EMAIL="t@example.com", GIT_TERMINAL_PROMPT="0")
+    p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env)
+    if p.returncode != 0:
+        raise RuntimeError("%s: %s" % (" ".join(args), p.stderr or p.stdout))
+    return p.stdout.strip()
+
+
+def commit_ver(repo, ver, body, msg):
+    with open(os.path.join(repo, "VERSION"), "w", encoding="utf-8") as f:
+        f.write(ver + "\n")
+    with open(os.path.join(repo, "token_annihilator.py"), "w", encoding="utf-8") as f:
+        f.write(body)
+    with open(os.path.join(repo, ".gitignore"), "w", encoding="utf-8") as f:
+        f.write("stats.db*\n__pycache__/\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", msg)
+
+
+def make_install(root):
+    remote, inst = os.path.join(root, "remote"), os.path.join(root, "install")
+    os.makedirs(remote)
+    git(remote, "init", "-b", "main")
+    commit_ver(remote, "1.0.0", "print('one')\n", "v1.0.0")
+    git(remote, "tag", "v1.0.0")
+    commit_ver(remote, "1.1.0", "print('two')\n", "v1.1.0")
+    git(remote, "tag", "-a", "v1.1.0", "-m", "release 1.1.0")
+    subprocess.run(["git", "clone", "--quiet", remote, inst], check=True, capture_output=True, text=True)
+    git(inst, "checkout", "--quiet", "--detach", "v1.0.0")
+    with open(os.path.join(inst, "stats.db"), "w", encoding="utf-8") as f:
+        f.write("precious")
+    return remote, inst
+
+
+def write_hook(inst, marker):
+    quoted = marker.replace("'", "'\\''")
+    script = "#!/bin/sh\ntouch '%s'\nexit 1\n" % quoted
+    hookdir = os.path.join(inst, ".git", "hooks")
+    os.makedirs(hookdir, exist_ok=True)
+    for name in ("pre-checkout", "post-checkout"):
+        path = os.path.join(hookdir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(script)
+        os.chmod(path, 0o755)
+
+
+class ReleaseHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.server.agent = self.headers.get("User-Agent")
+        if self.path != "/repos/SaltShaker87/token-annihilation-dashboard/releases/latest":
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+        body = self.server.body
+        self.send_response(self.server.code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class UpdateLogicTests(unittest.TestCase):
+    def test_page_offers_one_update_and_does_not_poll(self):
+        self.assertEqual(ta.PAGE.count("id=updBtn"), 1)
+        self.assertIn(">Update</button>", ta.PAGE)
+        chunk = ta.PAGE.split("function checkUpd", 1)[1]
+        self.assertNotIn("setInterval", chunk)
+        self.assertIn("checkUpd();", chunk)
+        self.assertIn("confirm:true", chunk)
+        self.assertIn("s.boot!==boot0", chunk.replace(" ", ""))
+
+    def test_official_urls_and_restart_command_are_fixed(self):
+        src = read_text(os.path.join(HERE, "token_annihilator.py"))
+        self.assertIn('OFFICIAL_GIT = "https://github.com/SaltShaker87/token-annihilation-dashboard.git"', src)
+        self.assertIn('RELEASES_URL = "https://api.github.com/repos/%s/releases/latest" % OFFICIAL_REPO', src)
+        self.assertNotIn("x-access-token", src)
+        self.assertEqual(ta.RESTART_ARGV, ["systemctl", "--user", "restart", "token-annihilator"])
+        blob = " ".join(ta.RESTART_ARGV)
+        for bad in ("ollama", "vllm", "llama", "11434", "11435", "8080", "8081", "8000", "8001"):
+            self.assertNotIn(bad, blob)
+        import inspect
+        self.assertEqual(list(inspect.signature(ta.apply_update).parameters), [])
+
+    def test_versions_and_tags(self):
+        self.assertEqual(ta.ver_tuple("v1.2.3"), ta.ver_tuple("1.2.3"))
+        self.assertLess(ta.ver_tuple("1.9.0"), ta.ver_tuple("1.10.0"))
+        self.assertEqual(ta.ver_tuple("v1.2.3\n"), (1, 2, 3))
+        for bad in ("1.2", "01.2.3", "v1.2.3-rc1", "main", "v1.2.3;reboot", "--version", ""):
+            self.assertIsNone(ta.ver_tuple(bad), bad)
+            self.assertFalse(ta.TAG_OK.match(bad), bad)
+        self.assertTrue(ta.TAG_OK.match("v0.0.0"))
+        self.assertFalse(ta.TAG_OK.match("1.2.3"))
+
+    def test_origin_and_confirm(self):
+        host = {"Origin": "http://127.0.0.1:11480", "Host": "127.0.0.1:11480"}
+        self.assertTrue(ta.origin_ok(host))
+        self.assertTrue(ta.origin_ok(dict(host, **{"Sec-Fetch-Site": "same-origin"})))
+        self.assertFalse(ta.origin_ok({}))
+        self.assertFalse(ta.origin_ok({"Host": "127.0.0.1:11480"}))
+        self.assertFalse(ta.origin_ok({"Origin": "http://evil.example", "Host": "127.0.0.1:11480"}))
+        self.assertFalse(ta.origin_ok({"Origin": "http://127.0.0.1:9", "Host": "127.0.0.1:11480"}))
+        self.assertFalse(ta.origin_ok({"Origin": "http://127.0.0.1:11480.evil", "Host": "127.0.0.1:11480"}))
+        self.assertFalse(ta.origin_ok(dict(host, **{"Sec-Fetch-Site": "cross-site"})))
+        self.assertFalse(ta.origin_ok({"Origin": "http://127.0.0.1:11480\r\nX: y", "Host": "127.0.0.1:11480"}))
+        seen = []
+        old = ta.apply_update
+        ta.apply_update = lambda: seen.append("go") or {"ok": True, "restart": "manual"}
+        try:
+            code, _ = ta.begin_update({"confirm": True, "tag": "main", "url": "https://evil.example/x.git", "ref": "refs/heads/main"}, host)
+            self.assertEqual(code, 200)
+            self.assertEqual(seen, ["go"])
+            code, res = ta.begin_update({"confirm": True, "tag": "v9.9.9", "url": "https://evil.example/x.git"},
+                                        {"Origin": "http://evil.example", "Host": "127.0.0.1:11480"})
+            self.assertEqual(code, 403)
+            self.assertFalse(res["ok"])
+            code, _ = ta.begin_update({"confirm": "true", "tag": "v9.9.9"}, host)
+            self.assertEqual(code, 400)
+            self.assertEqual(seen, ["go"])
+        finally:
+            ta.apply_update = old
+
+    def test_restart_plan_matches_only_this_process(self):
+        self.assertEqual(ta.service_state("", 5, ""), "manual")
+        self.assertEqual(ta.service_state("ActiveState=active\nMainPID=5\n", 5, None), "manual")
+        self.assertEqual(ta.service_state("ActiveState=active\nMainPID=5\n", 5, "abc"), "systemd")
+        self.assertEqual(ta.service_state("ActiveState=inactive\nMainPID=5\n", 5, "abc"), "manual")
+        self.assertEqual(ta.service_state("ActiveState=active\nMainPID=9\n", 5, "abc"), "manual")
+        self.assertEqual(ta.restart_plan(), "manual")
+
+    def test_schedule_restart_is_only_the_user_unit(self):
+        seen = []
+        def fake_popen(argv, **kw):
+            seen.append((list(argv), kw))
+            return object()
+        old_p, old_d = subprocess.Popen, ta.RESTART_DELAY
+        subprocess.Popen = fake_popen
+        ta.RESTART_DELAY = 0
+        try:
+            ta.schedule_restart().join(2)
+        finally:
+            subprocess.Popen = old_p
+            ta.RESTART_DELAY = old_d
+        self.assertEqual(len(seen), 1)
+        argv, kw = seen[0]
+        self.assertEqual(argv, ["systemctl", "--user", "restart", "token-annihilator"])
+        self.assertTrue(kw.get("start_new_session"))
+        self.assertIsNot(kw.get("shell"), True)
+
+    def test_github_payload_cannot_choose_a_url(self):
+        srv = ta.TS(("127.0.0.1", 0), ReleaseHandler)
+        srv.code, srv.body, srv.agent = 200, b"", None
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        old = ta.RELEASES_URL
+        try:
+            port = srv.server_address[1]
+            ta.RELEASES_URL = "http://127.0.0.1:%d/repos/SaltShaker87/token-annihilation-dashboard/releases/latest" % port
+            srv.code, srv.body = 404, b'{"message":"Not Found","tarball_url":"https://evil.example/nope.tar.gz"}'
+            self.assertIsNone(ta.fetch_latest())
+            payload = {"tag_name": "v1.2.3", "tarball_url": "https://evil.example/evil.tar.gz",
+                       "zipball_url": "https://evil.example/evil.zip", "target_commitish": "main",
+                       "html_url": "https://evil.example/release"}
+            srv.code, srv.body = 200, json.dumps(payload).encode()
+            self.assertEqual(ta.fetch_latest(), {"tag": "v1.2.3", "version": "1.2.3"})
+            self.assertEqual(srv.agent, "token-annihilation-dashboard")
+            srv.body = json.dumps({"tag_name": "v1.2.3-rc1", "tarball_url": "https://evil.example/x.tar.gz"}).encode()
+            with self.assertRaises(RuntimeError) as cm:
+                ta.fetch_latest()
+            self.assertNotIn("evil.example", str(cm.exception))
+            srv.code = 403
+            srv.body = b'{"message":"rate limit"}'
+            with self.assertRaises(RuntimeError):
+                ta.fetch_latest()
+        finally:
+            ta.RELEASES_URL = old
+            srv.shutdown(); srv.server_close()
+
+
+class UpdateRepoTests(unittest.TestCase):
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.real_head = subprocess.check_output(["git", "-C", HERE, "rev-parse", "HEAD"], text=True)
+        self.real_status = subprocess.check_output(["git", "-C", HERE, "status", "--porcelain"], text=True)
+        self._git_env = {k: os.environ.get(k) for k in ("GIT_DIR", "GIT_WORK_TREE")}
+        self.root = tempfile.mkdtemp(prefix="tad-upd-")
+        self.addCleanup(self._cleanup)
+        self._saved = {k: getattr(ta, k) for k in (
+            "HOME", "OFFICIAL_GIT", "RELEASES_URL", "fetch_latest", "schedule_restart", "restart_plan", "apply_update", "git_cmd")}
+        self.remote, self.inst = make_install(self.root)
+        self.marker = os.path.join(self.root, "hook-touched")
+        write_hook(self.inst, self.marker)
+        self.restarts = []
+        ta.HOME = self.inst
+        ta.OFFICIAL_GIT = self.remote
+        ta.fetch_latest = lambda: {"tag": "v1.1.0", "version": "1.1.0"}
+        ta.schedule_restart = lambda: self.restarts.append(1)
+        ta.restart_plan = lambda: "manual"
+
+    def _cleanup(self):
+        for k, v in self._saved.items():
+            setattr(ta, k, v)
+        try: os.chdir(self.cwd)
+        except OSError: pass
+        for k, v in self._git_env.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
+        subprocess.run(["rm", "-rf", self.root], check=False)
+        now = subprocess.check_output(["git", "-C", HERE, "rev-parse", "HEAD"], text=True)
+        st = subprocess.check_output(["git", "-C", HERE, "status", "--porcelain"], text=True)
+        self.assertEqual(now, self.real_head)
+        self.assertEqual(st, self.real_status)
+
+    def _ver(self):
+        return read_text(os.path.join(self.inst, "VERSION")).strip()
+
+    def _record(self):
+        calls, real = [], ta.git_cmd
+        def wrap(args, timeout=60):
+            calls.append(list(args))
+            return real(args, timeout)
+        ta.git_cmd = wrap
+        return calls
+
+    def test_no_release_and_current_release_do_not_checkout(self):
+        calls = self._record()
+        ta.fetch_latest = lambda: None
+        res = ta.apply_update()
+        self.assertFalse(res["ok"]); self.assertEqual(res["state"], "no_release"); self.assertEqual(self._ver(), "1.0.0")
+        ta.fetch_latest = lambda: {"tag": "v1.0.0", "version": "1.0.0"}
+        res = ta.apply_update()
+        self.assertTrue(res["ok"]); self.assertEqual(res["state"], "up_to_date"); self.assertIsNone(res["restart"])
+        self.assertEqual(self._ver(), "1.0.0")
+        self.assertFalse(any(c and c[0] in ("fetch", "checkout", "reset", "update-ref") for c in calls))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_dirty_tree_is_left_alone(self):
+        calls = self._record()
+        path = os.path.join(self.inst, "token_annihilator.py")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("# local tweak\n")
+        before = git(self.inst, "rev-parse", "HEAD")
+        res = ta.apply_update()
+        self.assertFalse(res["ok"]); self.assertEqual(res["state"], "dirty")
+        self.assertIn("token_annihilator.py", res["message"])
+        self.assertEqual(git(self.inst, "rev-parse", "HEAD"), before)
+        self.assertIn("# local tweak", read_text(path))
+        self.assertFalse(any(c and c[0] in ("fetch", "checkout", "reset", "update-ref") for c in calls))
+        self.assertEqual(self.restarts, [])
+
+    def test_local_commits_are_not_overwritten(self):
+        with open(os.path.join(self.inst, "LOCAL"), "w", encoding="utf-8") as f:
+            f.write("mine\n")
+        git(self.inst, "add", "LOCAL"); git(self.inst, "commit", "-m", "local only")
+        head = git(self.inst, "rev-parse", "HEAD")
+        calls = self._record()
+        res = ta.apply_update()
+        self.assertFalse(res["ok"]); self.assertEqual(res["state"], "blocked"); self.assertIn("commits", res["message"])
+        self.assertEqual(git(self.inst, "rev-parse", "HEAD"), head)
+        self.assertEqual(self._ver(), "1.0.0")
+        self.assertTrue(os.path.exists(os.path.join(self.inst, "LOCAL")))
+        self.assertFalse(any(c and c[0] in ("checkout", "reset") for c in calls))
+        self.assertEqual(self.restarts, [])
+
+    def test_bad_release_is_rolled_back(self):
+        commit_ver(self.remote, "9.9.9", "print('nope')\n", "wrong version file")
+        git(self.remote, "tag", "v1.2.0")
+        commit_ver(self.remote, "1.3.0", "def (\n", "syntax error")
+        git(self.remote, "tag", "v1.3.0")
+        old = git(self.inst, "rev-parse", "HEAD")
+        ta.fetch_latest = lambda: {"tag": "v1.2.0", "version": "1.2.0"}
+        res = ta.apply_update()
+        self.assertFalse(res["ok"]); self.assertIn("put back", res["message"])
+        self.assertEqual(git(self.inst, "rev-parse", "HEAD"), old)
+        self.assertEqual(self._ver(), "1.0.0")
+        self.assertEqual(read_text(os.path.join(self.inst, "token_annihilator.py")), "print('one')\n")
+        self.assertEqual(git(self.inst, "rev-parse", "refs/backup/token-annihilator-prev"), old)
+        ta.fetch_latest = lambda: {"tag": "v1.3.0", "version": "1.3.0"}
+        res = ta.apply_update()
+        self.assertFalse(res["ok"]); self.assertIn("syntax error", res["message"]); self.assertIn("put back", res["message"])
+        self.assertEqual(git(self.inst, "rev-parse", "HEAD"), old)
+        self.assertEqual(read_text(os.path.join(self.inst, "token_annihilator.py")), "print('one')\n")
+        self.assertEqual(read_text(os.path.join(self.inst, "stats.db")), "precious")
+        self.assertEqual(self.restarts, [])
+
+    def test_endpoint_installs_only_the_official_tag(self):
+        calls = self._record()
+        old = git(self.inst, "rev-parse", "HEAD")
+        srv = ta.TS(("127.0.0.1", 0), ta.Dash)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        origin = "http://127.0.0.1:%d" % port
+        try:
+            st, raw = req(port, "GET", "/api/update")
+            self.assertEqual(st, 200)
+            info = json.loads(raw)
+            self.assertEqual(info["state"], "update_available")
+            self.assertEqual(info["current"], "1.0.0")
+            self.assertEqual(info["latest"], "1.1.0")
+            self.assertTrue(info["boot"])
+            def post(body, headers):
+                raw_body = json.dumps(body).encode()
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+                c.request("POST", "/api/update", body=raw_body, headers=dict({"Content-Type": "application/json"}, **headers))
+                r = c.getresponse(); data = r.read(); c.close()
+                return r.status, json.loads(data)
+            self.assertEqual(post({"confirm": True, "tag": "main", "url": "https://evil.example/x.git"}, {})[0], 403)
+            self.assertEqual(post({"confirm": True, "url": "https://evil.example/x.git"}, {"Origin": "http://evil.example"})[0], 403)
+            self.assertEqual(post({"confirm": True}, {"Origin": origin, "Sec-Fetch-Site": "cross-site"})[0], 403)
+            self.assertEqual(post({"confirm": "true", "tag": "v9.9.9", "url": "https://evil.example/x.git"}, {"Origin": origin})[0], 400)
+            self.assertEqual(self._ver(), "1.0.0")
+            code, res = post({"confirm": True, "tag": "v9.9.9", "url": "https://evil.example/x.git", "ref": "main"},
+                             {"Origin": origin, "Sec-Fetch-Site": "same-origin"})
+            self.assertEqual(code, 200, res)
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["restart"], "manual")
+            self.assertEqual(res["version"], "1.1.0")
+            self.assertIn("yourself", res["message"])
+            self.assertEqual(self._ver(), "1.1.0")
+            self.assertEqual(read_text(os.path.join(self.inst, "token_annihilator.py")), "print('two')\n")
+            self.assertEqual(read_text(os.path.join(self.inst, "stats.db")), "precious")
+            self.assertEqual(git(self.inst, "rev-parse", "HEAD"), git(self.inst, "rev-parse", "v1.1.0^{commit}"))
+            self.assertEqual(git(self.inst, "rev-parse", "refs/backup/token-annihilator-prev"), old)
+            self.assertFalse(os.path.exists(self.marker))
+            self.assertEqual(self.restarts, [])
+            self.assertIn(["fetch", "--quiet", self.remote, "+refs/tags/v1.1.0:refs/tags/v1.1.0"], calls)
+            self.assertIn(["checkout", "--detach", "--quiet", "refs/tags/v1.1.0"], calls)
+            self.assertFalse(any(c and c[0] == "reset" for c in calls))
+            blob = " ".join(" ".join(c) for c in calls)
+            self.assertNotIn("evil.example", blob)
+            for bad in ("11434", "11435", "8080", "8081", "8000", "8001"):
+                self.assertNotIn(bad, blob)
+            self.assertEqual(os.getcwd(), self.cwd)
+            again = json.loads(req(port, "GET", "/api/update")[1])
+            self.assertEqual(again["state"], "up_to_date")
+            self.assertEqual(again["current"], "1.1.0")
+        finally:
+            srv.shutdown(); srv.server_close()
+
+    def test_git_dir_env_cannot_redirect_the_update(self):
+        other = tempfile.mkdtemp(prefix="tad-other-")
+        try:
+            git(other, "init", "-b", "main")
+            with open(os.path.join(other, "keep"), "w", encoding="utf-8") as f:
+                f.write("safe\n")
+            git(other, "add", "keep"); git(other, "commit", "-m", "keep")
+            other_head = git(other, "rev-parse", "HEAD")
+            os.environ["GIT_DIR"] = os.path.join(other, ".git")
+            os.environ["GIT_WORK_TREE"] = other
+            res = ta.apply_update()
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(self._ver(), "1.1.0")
+            env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")}
+            head = subprocess.run(["git", "-C", other, "rev-parse", "HEAD"], capture_output=True, text=True, env=env)
+            self.assertEqual(head.stdout.strip(), other_head)
+            self.assertFalse(os.path.exists(os.path.join(other, "token_annihilator.py")))
+            self.assertEqual(read_text(os.path.join(other, "keep")), "safe\n")
+        finally:
+            os.environ.pop("GIT_DIR", None)
+            os.environ.pop("GIT_WORK_TREE", None)
+            subprocess.run(["rm", "-rf", other], check=False)
+
 
 if __name__ == "__main__":
     unittest.main()
