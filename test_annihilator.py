@@ -291,6 +291,28 @@ class MascotTests(unittest.TestCase):
                 self.assertIn(b"WEBP", body[:16], path)
 
 
+
+class OdometerTests(unittest.TestCase):
+    def test_reel_count_matches_the_number_of_digits(self):
+        # runs the page's real odometer code in node; reels = digits, min 9, no spare leading zero
+        import re, shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        p = ta.PAGE
+        a = p.index("const ODO=$('odo')"); b = p.index("if(window.ResizeObserver)")
+        js = p[a:b]
+        stub = """
+const el=()=>({style:{setProperty(){}},parentElement:{clientWidth:100000},querySelectorAll(){return Array.from({length:DIG},()=>({style:{}}))},set innerHTML(v){},textContent:'',title:''});
+const $=()=>el();const fmt=n=>String(n);
+"""
+        cases = {0: 9, 99999999: 9, 100000000: 9, 999999999: 9, 1000000000: 10, 12345678901: 11}
+        out = subprocess.run([node, "-e", stub + js + "const r={};for(const n of " + json.dumps(list(cases)) + "){DIG=0;setOdo(n);r[n]=DIG}console.log(JSON.stringify(r))"],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = {int(k): v for k, v in json.loads(out.stdout).items()}
+        self.assertEqual(got, cases)
+
 class GaugeTests(unittest.TestCase):
     def test_first_sse_message_only_sets_the_baseline(self):
         # tokens already streamed before the page connected must not count as a 3 s arrival (gauge overshoot on load)

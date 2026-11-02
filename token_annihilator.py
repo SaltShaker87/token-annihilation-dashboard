@@ -668,19 +668,19 @@ const $=id=>document.getElementById(id),fmt=n=>Math.round(n||0).toLocaleString('
 const IDLE=["The GPU is napping. Somewhere, a cloud invoice sleeps uneasily.","Idle. Sharpening the tensor cores.","No tokens in sight. The silence is deafening (and free).","Waiting for prey. Feed me a prompt on port "+D.port+".","Plotting the next mass extinction event.","Resting between purges. The vocabulary trembles.","Dormant. Ancient token lineages enjoy a brief reprieve."];
 let tin=D.tin,tout=D.tout,nreq=D.nreq,evOut=D.ev_out,evS=D.ev_s,est=0,streams=[],idleI=0;
 $('sub').textContent="Every token erased here is a token the cloud will never bill you for. Total eradication, locally sourced.";
-// odometer: grows a reel whenever the count gains a digit (always one spare zero up front), shrinks the reels to fit
+// odometer: grows a reel whenever the count gains a digit (min 9 reels, no spare leading zero), shrinks the reels to fit
 // the card, and once even 18px reels won't fit it rolls in thousands/millions/... with a unit badge.
 const ODO=$('odo'),UNITS=['','THOUSAND','MILLION','BILLION','TRILLION','QUADRILLION'];let DIG=0,SC=0,DH=58,reels=[],odoN=0;
 const odoW=(dig,dw)=>dig*(dw+5)+Math.floor((dig-1)/3)*(dw/3+3);   // reel width + border + gap, plus the comma columns
 const odoDw=(dig,avail)=>(avail-odoW(dig,0))/(odoW(dig,1)-odoW(dig,0));   // widest reel that fits
 function odoBuild(dig,sc){DIG=dig;SC=sc;ODO.innerHTML=Array.from({length:dig},(_,i)=>(i&&(dig-i)%3==0?'<span class=sep>,</span>':'')+'<div class=dig><div>'+[...'0123456789'].map(d=>'<span>'+d+'</span>').join('')+'</div></div>').join('')+(sc?`<span class=unit>${UNITS[sc]}</span>`:'');reels=[...ODO.querySelectorAll('.dig>div')]}
 function odoFit(n){const avail=ODO.parentElement.clientWidth-30||560;let sc=0,dig;
- for(;;sc++){dig=Math.max(9-3*sc,String(Math.floor(n/1e3**sc)).length+1);if(odoW(dig,18)+(sc?110:0)<=avail||sc>=UNITS.length-1)break}
+ for(;;sc++){dig=Math.max(9-3*sc,String(Math.floor(n/1e3**sc)).length);if(odoW(dig,18)+(sc?110:0)<=avail||sc>=UNITS.length-1)break}
  const dw=Math.max(18,Math.min(36,Math.floor(odoDw(dig,avail-(sc?110:0)))));DH=Math.round(dw*1.6);ODO.style.setProperty('--dw',dw+'px');ODO.style.setProperty('--dh',DH+'px');
  if(dig!=DIG||sc!=SC)odoBuild(dig,sc)}
 const WORD=[[1e15,'quadrillion'],[1e12,'trillion'],[1e9,'billion'],[1e6,'million'],[1e3,'thousand']];
 function words(n){for(const [v,w] of WORD)if(n>=v)return '≈ '+(n/v).toLocaleString('en-US',{maximumFractionDigits:n/v<10?2:1})+' '+w+' tokens';return ''}
-function setOdo(n){n=Math.floor(n);odoN=n;if(String(Math.floor(n/1e3**SC)).length+1>DIG||!DIG)odoFit(n);
+function setOdo(n){n=Math.floor(n);odoN=n;if(String(Math.floor(n/1e3**SC)).length>DIG||!DIG)odoFit(n);
  const s=String(Math.floor(n/1e3**SC)).padStart(DIG,'0').slice(-DIG);reels.forEach((r,i)=>r.style.transform=`translateY(${-DH*s[i]}px)`);
  $('odoWords').textContent=words(n);ODO.title=fmt(n)+' tokens'}
 if(window.ResizeObserver)new ResizeObserver(()=>{if(DIG){odoFit(odoN);setOdo(odoN)}}).observe($('odoCard'));
