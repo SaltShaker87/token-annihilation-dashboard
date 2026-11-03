@@ -1051,10 +1051,23 @@ def local_modifications():
     p = git_cmd(["rev-parse", "--is-inside-work-tree"])
     if p.returncode != 0 or (p.stdout or "").strip() != "true":
         raise RuntimeError("not a git checkout")
-    p = git_cmd(["status", "--porcelain"])
+    # Tracked edits only. Untracked files (logs, local helper scripts) are never touched by a
+    # checkout unless the release adds the same path; untracked_collisions() checks that case.
+    p = git_cmd(["status", "--porcelain", "--untracked-files=no"])
     if p.returncode != 0:
         raise RuntimeError(_short(p.stderr or p.stdout or "git status failed"))
     return [ln[3:].strip() for ln in (p.stdout or "").splitlines() if len(ln) >= 4]
+
+def untracked_collisions(commit):
+    """Untracked, non-ignored files whose path the target commit tracks, so a checkout would replace them."""
+    p = git_cmd(["ls-files", "--others", "--exclude-standard", "-z"])
+    if p.returncode != 0:
+        raise RuntimeError(_short(p.stderr or p.stdout or "git ls-files failed"))
+    mine = set(x for x in (p.stdout or "").split("\0") if x)
+    if not mine:
+        return []
+    theirs = set(x for x in git_ok(["ls-tree", "-r", "-z", "--name-only", commit]).split("\0") if x)
+    return sorted(mine & theirs)
 
 def fetch_latest():
     """Latest published release, or None when GitHub has no release yet. Drafts and pre-releases are skipped by this API."""
@@ -1202,6 +1215,10 @@ def _apply_update():
     if anc.returncode != 0:
         return {"ok": False, "state": "error", "restart": None, "current": st["current"], "latest": ver, "tag": tag,
                 "message": "Not updated. Could not compare this install with %s (%s)." % (tag, _short(anc.stderr or anc.stdout))}
+    clash = untracked_collisions(peeled)
+    if clash:
+        return {"ok": False, "state": "dirty", "dirty": clash, "restart": None, "current": st["current"], "latest": ver, "tag": tag,
+                "message": "Not updated. %s adds files that already exist here untracked and would be overwritten: %s." % (tag, ", ".join(clash[:8]))}
     if local_modifications():
         return {"ok": False, "state": "dirty", "dirty": local_modifications(), "restart": None, "current": st["current"], "latest": ver, "tag": tag,
                 "message": "Not updated. Files changed while the release was downloading, so nothing was switched over."}

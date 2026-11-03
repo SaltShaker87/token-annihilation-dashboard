@@ -750,6 +750,15 @@ class UpdateRepoTests(unittest.TestCase):
         self.assertFalse(any(c and c[0] in ("fetch", "checkout", "reset", "update-ref") for c in calls))
         self.assertEqual(self.restarts, [])
 
+    def test_untracked_files_do_not_block_update(self):
+        for n in ("run.log", "my_helper.py"):
+            with open(os.path.join(self.inst, n), "w", encoding="utf-8") as f:
+                f.write("keep me\n")
+        self.assertEqual(ta.local_modifications(), [])
+        self.assertEqual(ta.update_status().get("dirty"), [])
+        for n in ("run.log", "my_helper.py"):
+            self.assertEqual(read_text(os.path.join(self.inst, n)), "keep me\n")
+
     def test_local_commits_are_not_overwritten(self):
         with open(os.path.join(self.inst, "LOCAL"), "w", encoding="utf-8") as f:
             f.write("mine\n")
