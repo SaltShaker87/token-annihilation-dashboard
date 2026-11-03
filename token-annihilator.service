@@ -3,7 +3,8 @@ Description=Token Annihilation Dashboard (Ollama / vLLM / llama.cpp token counte
 After=network-online.target
 
 [Service]
-# The dashboard Update button restarts only this unit: systemctl --user restart token-annihilator
+# After a successful update this process exits. Restart= starts the new version.
+# A copy started by hand reloads itself instead, so Restart= is not required for the update.
 WorkingDirectory=%h/token-annihilation-dashboard
 # Uncomment and edit what you use (see README):
 # Ollama :11435 runs by default; vLLM :8001 / llama.cpp :8081 open once vLLM / llama-server answer on 8000 / 8080.

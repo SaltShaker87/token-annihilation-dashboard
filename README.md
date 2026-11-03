@@ -69,7 +69,7 @@ When a newer release exists, the button shows the version you have next to the l
 - stop if you have local commits that the release does not already contain
 - download that release's git tag from the official repo only (`github.com/SaltShaker87/token-annihilation-dashboard`). A version, link, or branch sent by the browser is ignored. There is no setting to point this at another URL
 - keep the previous checkout under `refs/backup/token-annihilator-prev` and put it back if the new files do not match the release
-- restart the `token-annihilator` user service. If you started the dashboard by hand instead of systemd, it leaves the new files in place and tells you to restart it yourself
+- restart itself, and only after the new files match the release. If systemd is running it and that service is set to come back (the included unit has `Restart=always`; the service can have any name), the process exits and systemd starts it again. If you started it in a terminal, it reloads itself in place. The page notices, reconnects, and shows the new version. Only if that fails does it ask you to start it again yourself
 
 Your stats database stays. Ollama, llama.cpp, vLLM, their ports, and any other service are not restarted or reconfigured.
 
