@@ -777,7 +777,7 @@ $('share').onclick=async()=>{const W=1200,H=630,cv=document.createElement('canva
  const img=new Image();img.src='static/icon-180.png';try{await img.decode();x.drawImage(img,52,44,120,120)}catch(_){}
  x.fillStyle=G;x.font='800 46px '+SF;x.fillText('DGX Token Annihilator',196,98);x.fillStyle='#9aa3b5';x.font='24px '+SF;x.fillText('Local mass extinction report · '+new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}),196,138);
  x.font='600 20px '+SF;x.fillText('TOKENS OBLITERATED',56,228);x.fillStyle=G;let fs=84;do x.font=`800 ${fs}px ui-monospace,Menlo,monospace`;while(x.measureText(fmt(tin+tout)).width>600&&(fs-=4)>30);x.fillText(fmt(tin+tout),56,310);
- x.fillStyle='#9aa3b5';x.font='600 20px '+SF;x.fillText(fitText(x,'CLOUD INVOICES ERADICATED'+(hero?' (vs '+hero.label.toUpperCase()+')':''),600),56,370);x.fillStyle='#fff';x.font='800 54px '+SF;x.fillText(hero?money(cost(hero,tin,tout)):'–',56,428);
+ x.fillStyle='#9aa3b5';x.font='600 20px '+SF;x.fillText(fitText(x,'CLOUD INVOICES ERADICATED'+(hero?' (vs '+hero.label.toUpperCase()+')':''),600),56,370);x.fillStyle=G;x.font='800 54px '+SF;x.fillText(hero?money(cost(hero,tin,tout)):'–',56,428);
  const L=ST.leaderboard[0];x.fillStyle='#c9ced8';x.font='22px '+SF;
  [['Lineages erased',fmt(nreq)],['Avg speed',evS>0?(evOut/evS).toFixed(1)+' tok/s':'–'],['Top model',L?L.model:'–']].forEach(([a,b],i)=>{x.fillStyle='#9aa3b5';x.fillText(a,56,488+i*36);x.fillStyle=G;x.font='700 22px '+SF;x.fillText(fitText(x,b,330),300,488+i*36);x.font='22px '+SF});
  x.fillStyle='#9aa3b5';x.font='600 20px '+SF;x.fillText('TROPHY CASE',700,228);
