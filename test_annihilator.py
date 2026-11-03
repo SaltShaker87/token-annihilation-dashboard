@@ -299,7 +299,7 @@ class MascotTests(unittest.TestCase):
 
 class GaugeDecayTests(unittest.TestCase):
     # runs the page's real gauge animation loop in node with a fake clock and DOM
-    def run_gauge(self, start_tps, arrivals, hz, secs):
+    def run_gauge(self, start_tps, arrivals, hz, secs, win=3000, tau="1/3"):
         import shutil
         node = shutil.which("node")
         if not node:
@@ -308,13 +308,22 @@ class GaugeDecayTests(unittest.TestCase):
         js = p[p.index("let last=performance.now()"):p.index("document.addEventListener('visibilitychange'")]
         stub = """let NOW=0;const performance={now:()=>NOW};const document={hidden:false};const requestAnimationFrame=()=>{};
 const E={};const $=id=>E[id]||(E[id]={textContent:'',setAttribute(){}});
-let curTps=%f,hist=Array(60).fill(0),secOut=0,arr=[];const WIN=3000;
-""" % start_tps
-        drive = """const A=%s,step=1000/%d;let i=0;for(let t=step;t<=%d;t+=step){while(i<A.length&&A[i][0]<=t){arr.push([A[i][0],A[i][1]]);i++}NOW=t;frame(t)}
+let curTps=%f,hist=Array(60).fill(0),secOut=0,arr=[];const WIN=%d,T0=0,TAU=%s;let seeded=true;
+""" % (start_tps, win, tau)
+        drive = """const A=%s,step=1000/%d;let i=0;for(let t=step;t<=%d;t+=step){while(i<A.length&&A[i][A[i].length>2?1:0]<=t){arr.push(A[i].length>2?A[i]:[A[i][0],A[i][0],A[i][1]]);i++}NOW=t;frame(t)}
 console.log(JSON.stringify({shown:$('tps').textContent,cur:curTps}))""" % (json.dumps(arrivals), hz, secs * 1000)
         out = subprocess.run([node, "-e", stub + js + drive], capture_output=True, text=True, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         return json.loads(out.stdout)
+
+    def test_batched_non_streamed_load_is_steady(self):
+        # 8 parallel non-streamed requests, each 20 s long, 400 tokens, finishing together every 20 s = 160 tok/s.
+        # Spread over their duration in a 60 s window, the needle must hold near 160 instead of spiking and dropping.
+        arrivals = [[e - 20000, e, 3200] for e in range(20000, 120001, 20000)]
+        seen = []
+        for secs in range(62, 121, 3):
+            seen.append(float(self.run_gauge(160, [a for a in arrivals], 60, secs, win=60000, tau=6)["shown"]))
+        self.assertTrue(all(110 <= v <= 180 for v in seen), seen); self.assertLess(max(seen) - min(seen), 30, seen)   # the batch still in flight is unknown until it ends, so it reads a bit under 160
 
     def test_idle_gauge_decays_to_zero(self):
         # a finished request leaves the gauge at ~1.6 tok/s; with no new tokens it must reach 0 on any refresh rate
@@ -406,11 +415,11 @@ class GaugeTests(unittest.TestCase):
     def test_non_streamed_request_moves_the_gauge_when_it_finishes(self):
         # aider through vLLM is non-streamed: out_est stays 0, so the gauge read exactly 0 while the total climbed
         r = self.run_done([{"in": 1222, "out": 62, "est": 0}])
-        self.assertEqual(r["arr"], [[1, 62]]); self.assertEqual(r["secOut"], 62)
+        self.assertEqual(r["arr"], [[1, 1, 62]]); self.assertEqual(r["secOut"], 62)
 
     def test_streamed_tokens_are_not_counted_twice(self):
         r = self.run_done([{"out": 50, "est": 48}, {"out": 10, "est": 10}])
-        self.assertEqual(r["arr"], [[1, 2]])
+        self.assertEqual(r["arr"], [[1, 1, 2]])
 
     def test_done_before_baseline_does_not_spike(self):
         self.assertEqual(self.run_done([{"out": 500, "est": 0}], primed=False)["arr"], [])
