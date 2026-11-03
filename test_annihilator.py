@@ -193,7 +193,7 @@ class ProxyTests(unittest.TestCase):
         self.assertIn('src="static/icon.webp"', text); self.assertIn("static/splash.mp4", text)
         self.assertIn("esc(x.model)", text)   # model names are HTML-escaped client-side; embedded JSON escapes "</"
         self.assertIn("id=updBtn", text); self.assertIn(">Update</button>", text)
-        self.assertIn('"version": "0.0.0"', text); self.assertIn('"boot":', text)
+        self.assertIn('"version": "%s"' % ta.read_version(), text); self.assertIn('"boot":', text)
         st, img = req(self.dash, "GET", "/static/icon-32.png"); self.assertTrue(img.startswith(b"\x89PNG"))
         j = json.loads(req(self.dash, "GET", "/api/stats")[1])
         labels = {s["label"]: s["tok"] for s in j["sources"]}
@@ -250,45 +250,50 @@ class ProxyTests(unittest.TestCase):
 class MascotTests(unittest.TestCase):
     def test_brand_uses_the_inhaling_robot(self):
         p = ta.PAGE
-        self.assertIn('id=mascotVid', p)
-        self.assertIn('id=mascotStill', p)
-        self.assertIn('<video id=mascotVid muted playsinline loop preload=none poster="static/mascot-idle.png"', p)
-        self.assertLess(p.index('static/mascot-inhale.webm'), p.index('static/mascot-inhale.mp4'))
-        self.assertIn('type="video/webm"', p)
-        self.assertIn('type="video/mp4"', p)
-        self.assertIn('srcset="static/mascot-idle.webp"', p)
+        self.assertIn('id=mascotImg', p)
+        self.assertIn('src="static/mascot-idle.webp"', p)
+        self.assertIn('href="static/mascot-inhale.webp"', p)   # preloaded so the first swap is not blank
         self.assertIn('alt="Angry chip robot inhaling tokens"', p)
         self.assertIn('mascotSync()', p)
         self.assertIn('setTimeout(go,1500)', p)
-        self.assertIn('if(mascotOn)', p)   # an SSE tick must not restart the loop at frame 0
+        self.assertIn('if(mascotOn)return', p)   # an SSE tick must not restart the loop
         self.assertIn('mascotIdle(true)', p)   # a dropped feed goes idle immediately
-        self.assertIn(".brand .mascot video{display:none!important}", p)
+        self.assertIn("prefers-reduced-motion: reduce", p)
+        self.assertNotIn("mascotVid", p)
+        self.assertNotIn("mascot-inhale.webm", p)
+        self.assertNotIn("mascot-inhale.mp4", p)
+        self.assertNotIn("mascot-idle.png", p)
         self.assertNotIn("static/icon-128.png", p)
         self.assertIn('src="static/icon.webp"', p)   # milestone box still uses the old art
         self.assertIn('class=orb src="static/icon.webp"', p)
         self.assertIn('poster="static/icon-180.png"', p)   # share / celebration video untouched
+        self.assertIn("static/splash.mp4", p)
 
     def test_mascot_files_are_served_with_their_types(self):
         srv = ta.TS(("127.0.0.1", 0), ta.Dash)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
         port = srv.server_address[1]
-        expect = [
-            ("/static/mascot-idle.png", "image/png", b"\x89PNG"),
+        bodies = {}
+        for path, ctype, magic in (
             ("/static/mascot-idle.webp", "image/webp", b"RIFF"),
             ("/static/mascot-inhale.webp", "image/webp", b"RIFF"),
-            ("/static/mascot-inhale.webm", "video/webm", b"\x1a\x45\xdf\xa3"),
-            ("/static/mascot-inhale.mp4", "video/mp4", b"ftyp"),
-        ]
-        for path, ctype, magic in expect:
+        ):
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("GET", path)
             r = c.getresponse(); body = r.read(); c.close()
             self.assertEqual(r.status, 200, path)
             self.assertEqual(r.getheader("Content-Type"), ctype, path)
-            self.assertIn(magic, body[:16], (path, body[:16]))
-            if ctype == "image/webp":
-                self.assertIn(b"WEBP", body[:16], path)
+            self.assertTrue(body.startswith(magic) and b"WEBP" in body[:16], path)
+            bodies[path] = body
+        self.assertNotIn(b"ANIM", bodies["/static/mascot-idle.webp"])   # the still is one frame
+        self.assertIn(b"ANIM", bodies["/static/mascot-inhale.webp"])   # the loop is an animated webp
+        self.assertLess(len(bodies["/static/mascot-inhale.webp"]), 260000)
+        for path in ("/static/mascot-inhale.webm", "/static/mascot-inhale.mp4", "/static/mascot-idle.png"):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", path)
+            r = c.getresponse(); r.read(); c.close()
+            self.assertEqual(r.status, 404, path)
 
 
 
