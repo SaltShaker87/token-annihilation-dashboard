@@ -577,16 +577,14 @@ class UpdateLogicTests(unittest.TestCase):
         self.assertIn("checkUpd();", chunk)
         self.assertIn("confirm:true", chunk)
         self.assertIn("s.boot!==boot0", chunk.replace(" ", ""))
+        self.assertIn("j.restart=='systemd'||j.restart=='reexec'", chunk.replace(" ", ""))
 
     def test_official_urls_and_restart_command_are_fixed(self):
         src = read_text(os.path.join(HERE, "token_annihilator.py"))
         self.assertIn('OFFICIAL_GIT = "https://github.com/SaltShaker87/token-annihilation-dashboard.git"', src)
         self.assertIn('RELEASES_URL = "https://api.github.com/repos/%s/releases/latest" % OFFICIAL_REPO', src)
         self.assertNotIn("x-access-token", src)
-        self.assertEqual(ta.RESTART_ARGV, ["systemctl", "--user", "restart", "token-annihilator"])
-        blob = " ".join(ta.RESTART_ARGV)
-        for bad in ("ollama", "vllm", "llama", "11434", "11435", "8080", "8081", "8000", "8001"):
-            self.assertNotIn(bad, blob)
+        self.assertNotIn('["systemctl", "--user", "restart"', src)   # do not restart a hardcoded unit name
         import inspect
         self.assertEqual(list(inspect.signature(ta.apply_update).parameters), [])
 
@@ -629,31 +627,61 @@ class UpdateLogicTests(unittest.TestCase):
             ta.apply_update = old
 
     def test_restart_plan_matches_only_this_process(self):
-        self.assertEqual(ta.service_state("", 5, ""), "manual")
-        self.assertEqual(ta.service_state("ActiveState=active\nMainPID=5\n", 5, None), "manual")
-        self.assertEqual(ta.service_state("ActiveState=active\nMainPID=5\n", 5, "abc"), "systemd")
-        self.assertEqual(ta.service_state("ActiveState=inactive\nMainPID=5\n", 5, "abc"), "manual")
-        self.assertEqual(ta.service_state("ActiveState=active\nMainPID=9\n", 5, "abc"), "manual")
-        self.assertEqual(ta.restart_plan(), "manual")
-
-    def test_schedule_restart_is_only_the_user_unit(self):
-        seen = []
-        def fake_popen(argv, **kw):
-            seen.append((list(argv), kw))
-            return object()
-        old_p, old_d = subprocess.Popen, ta.RESTART_DELAY
-        subprocess.Popen = fake_popen
-        ta.RESTART_DELAY = 0
+        show = "ActiveState=active\nMainPID=5\nRestart=always\n"
+        self.assertIsNone(ta.exit_code_from_show(show, 5, ""))
+        self.assertIsNone(ta.exit_code_from_show(show, 5, None))
+        self.assertEqual(ta.exit_code_from_show(show, 5, "abc"), 0)   # Restart=always: a clean exit is enough
+        self.assertEqual(ta.exit_code_from_show("ActiveState=active\nMainPID=5\nRestart=on-success\n", 5, "abc"), 0)
+        self.assertEqual(ta.exit_code_from_show("ActiveState=active\nMainPID=5\nRestart=on-failure\n", 5, "abc"), 1)
+        self.assertIsNone(ta.exit_code_from_show("ActiveState=active\nMainPID=5\nRestart=no\n", 5, "abc"))
+        self.assertIsNone(ta.exit_code_from_show("ActiveState=inactive\nMainPID=5\nRestart=always\n", 5, "abc"))
+        self.assertIsNone(ta.exit_code_from_show("ActiveState=active\nMainPID=9\nRestart=always\n", 5, "abc"))
+        self.assertEqual(ta.unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/spark-stats.service\n"), "spark-stats")
+        self.assertEqual(ta.unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/token-annihilator.service\n"), "token-annihilator")
+        self.assertIsNone(ta.unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service\n"))
+        self.assertIsNone(ta.unit_from_cgroup("0::/app.slice/evil;reboot.service\n"))
+        saved = os.environ.get("INVOCATION_ID")
+        os.environ.pop("INVOCATION_ID", None)
         try:
-            ta.schedule_restart().join(2)
+            self.assertEqual(ta.restart_plan(), "reexec")   # started by hand: reload in place, do not look for a unit name
         finally:
-            subprocess.Popen = old_p
-            ta.RESTART_DELAY = old_d
-        self.assertEqual(len(seen), 1)
-        argv, kw = seen[0]
-        self.assertEqual(argv, ["systemctl", "--user", "restart", "token-annihilator"])
-        self.assertTrue(kw.get("start_new_session"))
-        self.assertIsNot(kw.get("shell"), True)
+            if saved is not None:
+                os.environ["INVOCATION_ID"] = saved
+
+    def test_schedule_restart_reloads_or_exits_and_does_not_shell_out(self):
+        seen = {}
+        def fake_exec(exe, argv):
+            seen["exec"] = (exe, list(argv))
+        def fake_exit(code):
+            seen["exit"] = code
+        old = (os.execv, os._exit, ta.RESTART_DELAY, ta.systemd_exit_code, ta.DASH_SERVER, ta.cloexec_all, ta.close_listeners, ta._RESTART.copy())
+        os.execv, os._exit = fake_exec, fake_exit
+        ta.RESTART_DELAY = 0
+        ta.DASH_SERVER = None
+        ta.cloexec_all = lambda: seen.setdefault("cloexec", True)
+        ta.close_listeners = lambda: seen.setdefault("closed", True)
+        ta._RESTART.update(go=False, code=None)
+        try:
+            ta.systemd_exit_code = lambda: None
+            ta.schedule_restart().join(2)
+            self.assertEqual(seen.get("exec"), (sys.executable, [sys.executable] + sys.argv))
+            self.assertNotIn("exit", seen)
+            self.assertTrue(seen.get("cloexec") and seen.get("closed"))
+            seen.clear()
+            ta._RESTART.update(go=False, code=None)
+            ta.systemd_exit_code = lambda: 0
+            ta.schedule_restart().join(2)
+            self.assertEqual(seen.get("exit"), 0)
+            self.assertNotIn("exec", seen)
+            seen.clear()
+            ta._RESTART.update(go=False, code=None)
+            ta.systemd_exit_code = lambda: 1
+            ta.schedule_restart().join(2)
+            self.assertEqual(seen.get("exit"), 1)
+            self.assertNotIn("exec", seen)
+        finally:
+            os.execv, os._exit, ta.RESTART_DELAY, ta.systemd_exit_code, ta.DASH_SERVER, ta.cloexec_all, ta.close_listeners, saved = old
+            ta._RESTART.clear(); ta._RESTART.update(saved)
 
     def test_github_payload_cannot_choose_a_url(self):
         srv = ta.TS(("127.0.0.1", 0), ReleaseHandler)
@@ -875,6 +903,132 @@ class UpdateRepoTests(unittest.TestCase):
             os.environ.pop("GIT_DIR", None)
             os.environ.pop("GIT_WORK_TREE", None)
             subprocess.run(["rm", "-rf", other], check=False)
+
+
+class LatestRelease(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        body = b'{"tag_name":"v9.0.1"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class RestartEndToEndTests(unittest.TestCase):
+    """A hand-started dashboard installs a newer tag and reloads itself. No systemd, no manual restart."""
+
+    def test_reexec_comes_back_on_the_new_version_and_rebinds(self):
+        root = tempfile.mkdtemp(prefix="tad-reexec-")
+        remote, inst = os.path.join(root, "remote"), os.path.join(root, "install")
+        rel = ta.TS(("127.0.0.1", 0), LatestRelease)
+        threading.Thread(target=rel.serve_forever, daemon=True).start()
+        proc = None
+        try:
+            src = read_text(os.path.join(HERE, "token_annihilator.py"))
+            src = src.replace('OFFICIAL_GIT = "https://github.com/SaltShaker87/token-annihilation-dashboard.git"',
+                              "OFFICIAL_GIT = %r" % remote)
+            src = src.replace('RELEASES_URL = "https://api.github.com/repos/%s/releases/latest" % OFFICIAL_REPO',
+                              "RELEASES_URL = %r" % ("http://127.0.0.1:%d/latest" % rel.server_address[1]))
+            os.makedirs(remote)
+            git(remote, "init", "-b", "main")
+            def publish(ver, body):
+                with open(os.path.join(remote, "VERSION"), "w", encoding="utf-8") as f:
+                    f.write(ver + "\n")
+                with open(os.path.join(remote, "token_annihilator.py"), "w", encoding="utf-8") as f:
+                    f.write(body)
+                with open(os.path.join(remote, "prices.json"), "w", encoding="utf-8") as f:
+                    f.write(read_text(os.path.join(HERE, "prices.json")))
+                with open(os.path.join(remote, ".gitignore"), "w", encoding="utf-8") as f:
+                    f.write("stats.db*\n__pycache__/\n")
+                git(remote, "add", "-A")
+                git(remote, "commit", "-m", "v" + ver)
+                git(remote, "tag", "-a", "v" + ver, "-m", "v" + ver)
+            publish("9.0.0", src)
+            publish("9.0.1", src)
+            subprocess.run(["git", "clone", "--quiet", remote, inst], check=True, capture_output=True, text=True)
+            git(inst, "checkout", "--quiet", "--detach", "v9.0.0")
+            dash, proxy = 18780, 18735
+            env = os.environ.copy()
+            env.update(DASH_BIND="127.0.0.1", DASH_PORT=str(dash), PROXY_BIND="127.0.0.1", PROXY_PORT=str(proxy),
+                       OLLAMA_PROXY="1", OPENAI_PROXIES="", LLAMA_LOG="", STATS_DB=os.path.join(inst, "stats.db"),
+                       PYTHONDONTWRITEBYTECODE="1")
+            env.pop("INVOCATION_ID", None)   # this is a hand start, so the process must reload itself
+            proc = subprocess.Popen([sys.executable, os.path.join(inst, "token_annihilator.py")], cwd=inst, env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            boot_log = []
+            def drain():
+                for line in proc.stdout:
+                    boot_log.append(line)
+            threading.Thread(target=drain, daemon=True).start()
+            deadline = time.time() + 8
+            up = None
+            while time.time() < deadline:
+                try:
+                    up = json.loads(req(dash, "GET", "/api/update")[1]); break
+                except Exception:
+                    time.sleep(0.1)
+            self.assertIsNotNone(up, "".join(boot_log[-20:]))
+            self.assertEqual(up["current"], "9.0.0")
+            old_boot, old_pid = up["boot"], up["boot"].split("-", 1)[0]
+            self.assertEqual(req(proxy, "GET", "/api/version")[0], 502)   # proxy is listening; nothing is upstream yet
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError:
+                sync_playwright = None
+            if sync_playwright:
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(executable_path="/usr/bin/google-chrome", headless=True, args=["--no-sandbox"])
+                    page = browser.new_page()
+                    page.goto("http://127.0.0.1:%d/" % dash, wait_until="domcontentloaded")
+                    page.wait_for_function("() => (document.getElementById('updHint').textContent||'').includes('update available')", timeout=15000)
+                    page.click("#updBtn")
+                    page.wait_for_selector("#updGo", state="visible", timeout=10000)
+                    page.click("#updGo")
+                    page.wait_for_function("() => { const t=document.getElementById('updHint').textContent||''; return t.includes('up to date') && t.includes('9.0.1'); }", timeout=25000)
+                    page.wait_for_function("() => (document.getElementById('conn').textContent||'').includes('connected')", timeout=15000)
+                    os.makedirs("/opt/cursor/artifacts", exist_ok=True)
+                    page.screenshot(path="/opt/cursor/artifacts/screenshot_update_reloaded.png")
+                    browser.close()
+            else:
+                origin = "http://127.0.0.1:%d" % dash
+                raw = json.dumps({"confirm": True}).encode()
+                c = http.client.HTTPConnection("127.0.0.1", dash, timeout=30)
+                c.request("POST", "/api/update", body=raw, headers={"Content-Type": "application/json", "Origin": origin,
+                          "Host": "127.0.0.1:%d" % dash, "Sec-Fetch-Site": "same-origin"})
+                r = c.getresponse(); res = json.loads(r.read()); c.close()
+                self.assertEqual(r.status, 200, res)
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(res["restart"], "reexec", res)
+            new = None
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                try:
+                    got = json.loads(req(dash, "GET", "/api/update")[1])
+                    if got.get("boot") and got["boot"] != old_boot and got.get("current") == "9.0.1":
+                        new = got; break
+                except Exception:
+                    pass
+                time.sleep(0.15)
+            self.assertIsNotNone(new, "".join(boot_log[-30:]))
+            self.assertEqual(new["boot"].split("-", 1)[0], old_pid)   # same process, reloaded in place
+            self.assertEqual(new["state"], "up_to_date")
+            self.assertEqual(req(proxy, "GET", "/api/version")[0], 502)   # proxy port was bound again by the reloaded process
+            self.assertEqual(read_text(os.path.join(inst, "VERSION")).strip(), "9.0.1")
+            # what the page does after the answer: wait until the boot id changes, then reload
+            self.assertIn("j.restart=='systemd'||j.restart=='reexec'", ta.PAGE.replace(" ", ""))
+            self.assertIn("location.reload()", ta.PAGE)
+        finally:
+            if proc:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try: proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired: proc.kill()
+                try: proc.stdout.close()
+                except Exception: pass
+            rel.shutdown(); rel.server_close()
+            subprocess.run(["rm", "-rf", root], check=False)
 
 
 if __name__ == "__main__":

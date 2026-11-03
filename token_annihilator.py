@@ -2,7 +2,7 @@
 """Token Annihilation Dashboard: transparent token-counting proxies (Ollama, vLLM, llama.cpp / any
 OpenAI-compatible server) + llama.cpp log tailing + a tiny, gloriously dramatic dashboard. Stdlib only.
 MIT licensed. https://github.com/SaltShaker87/token-annihilation-dashboard"""
-import ast, http.client, http.server, json, os, re, sqlite3, subprocess, sys, threading, time, html, urllib.error, urllib.request
+import ast, fcntl, http.client, http.server, json, os, re, sqlite3, subprocess, sys, threading, time, html, urllib.error, urllib.request
 from datetime import datetime
 from socketserver import ThreadingMixIn
 
@@ -529,8 +529,8 @@ class Dash(http.server.BaseHTTPRequestHandler):
             if p == "/api/update":
                 code, res = begin_update(body, self.headers)
                 self.json(res, code)
-                # Answer first. A systemd restart tears this process down a moment later.
-                if code == 200 and res.get("ok") and res.get("restart") == "systemd":
+                # Answer first. The process reloads a moment later, after this response is on the wire.
+                if code == 200 and res.get("ok") and res.get("restart") in ("systemd", "reexec"):
                     try: schedule_restart()
                     except Exception as e: print("restart failed:", e, file=sys.stderr, flush=True)
                 return
@@ -900,7 +900,7 @@ $('updDlg').onclose=async()=>{
  if(updMode!=='ask'||$('updDlg').returnValue!=='ok')return;
  updMode='run';$('updGo').hidden=true;$('updBtn').disabled=true;$('updHint').className='muted';$('updHint').textContent='updating…';
  let j=null;try{j=await(await fetch('api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})})).json()}catch(_){j=null}
- if(j&&j.ok&&j.restart=='systemd'){if(j.version)ss('setItem','tad.updated',j.version);$('updHint').textContent='restarting the dashboard…';if(!await waitBoot())$('updHint').textContent='the new version is installed, but the dashboard did not come back. Run: systemctl --user status token-annihilator';$('updBtn').disabled=false;return}
+ if(j&&j.ok&&(j.restart=='systemd'||j.restart=='reexec')){if(j.version)ss('setItem','tad.updated',j.version);$('updHint').textContent='restarting the dashboard…';if(!await waitBoot())$('updHint').textContent='the new version is installed, but the dashboard did not come back. Start it again yourself.';$('updBtn').disabled=false;return}
  if(!j){$('updHint').textContent='waiting for the dashboard…';if(await waitBoot())return;j={ok:false,message:'The update did not finish, and the dashboard never came back with a new start.'}}
  $('updBtn').disabled=false;
  if(j.ok)$('updHint').className='hint-new',$('updHint').textContent='updated · restart required';
@@ -1010,9 +1010,10 @@ def llama_backfill():
 OFFICIAL_REPO = "SaltShaker87/token-annihilation-dashboard"
 OFFICIAL_GIT = "https://github.com/SaltShaker87/token-annihilation-dashboard.git"
 RELEASES_URL = "https://api.github.com/repos/%s/releases/latest" % OFFICIAL_REPO
-SERVICE = "token-annihilator"
-RESTART_ARGV = ["systemctl", "--user", "restart", SERVICE]
 RESTART_DELAY = 0.6
+UNIT_OK = re.compile(r"^[A-Za-z0-9_.@:-]+$")
+DASH_SERVER = None
+_RESTART = {"go": False, "code": None}
 BOOT_ID = "%d-%d" % (os.getpid(), time.time_ns())
 TAG_OK = re.compile(r"^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 VER_OK = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -1242,10 +1243,10 @@ def _apply_update():
                 "message": "Could not switch to %s (%s). The previous version was put back." % (tag, _short(e))}
     mode = restart_plan()
     msg = "Updated to v%s." % ver
-    if mode == "systemd":
+    if mode in ("systemd", "reexec"):
         msg += " Restarting the dashboard."
     else:
-        msg += " The new files are in place, but this dashboard was not started by its systemd service, so restart it yourself to load them. The usual command is: systemctl --user restart token-annihilator"
+        msg += " The new files are in place, but the dashboard could not restart itself. Start it again yourself."
     return {"ok": True, "state": "updated", "version": ver, "tag": tag, "previous": old, "current": ver, "restart": mode, "boot": BOOT_ID, "message": msg}
 
 def apply_update():
@@ -1289,38 +1290,123 @@ def begin_update(body, headers):
         return 400, {"ok": False, "state": "confirm", "message": "Confirm the update in the dashboard before it will install a release."}
     return 200, apply_update()
 
-def service_state(show_text, pid, invocation_id):
+def unit_from_cgroup(text):
+    """App unit name from /proc/self/cgroup, ignoring the user@ slice itself."""
+    found = None
+    for line in (text or "").splitlines():
+        for part in line.replace("\\", "/").split("/"):
+            part = part.strip()
+            if not part.endswith(".service"):
+                continue
+            name = part[:-len(".service")]
+            if name.startswith("user@"):
+                continue
+            found = name
+    if found and UNIT_OK.match(found):
+        return found
+    return None
+
+def exit_code_from_show(text, pid, invocation_id):
+    """How to exit so this user service's Restart= will start us again. None means it will not."""
     if not invocation_id:
-        return "manual"
+        return None
     info = {}
-    for line in (show_text or "").splitlines():
+    for line in (text or "").splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
             info[k.strip()] = v.strip()
-    if info.get("ActiveState") == "active" and info.get("MainPID") == str(pid):
-        return "systemd"
-    return "manual"
+    if info.get("ActiveState") != "active" or info.get("MainPID") != str(pid):
+        return None
+    mode = info.get("Restart") or "no"
+    if mode in ("always", "on-success"):
+        return 0   # a clean exit is enough, and it does not look like a crash
+    if mode == "on-failure":
+        return 1
+    return None
 
-def restart_plan():
-    """systemd only when this process is the token-annihilator user service. Anything else is left for the operator."""
+def systemd_exit_code():
     if not os.environ.get("INVOCATION_ID"):
-        return "manual"
+        return None
     try:
-        p = subprocess.run(["systemctl", "--user", "show", SERVICE, "-p", "MainPID", "-p", "ActiveState"],
+        with open("/proc/self/cgroup", encoding="utf-8") as f:
+            unit = unit_from_cgroup(f.read())
+    except OSError:
+        return None
+    if not unit:
+        return None
+    try:
+        p = subprocess.run(["systemctl", "--user", "show", unit, "-p", "MainPID", "-p", "Restart", "-p", "ActiveState"],
                            capture_output=True, text=True, errors="replace", timeout=5)
         text = p.stdout if p.returncode == 0 else ""
     except Exception:
-        return "manual"
-    return service_state(text, os.getpid(), os.environ.get("INVOCATION_ID"))
+        return None
+    return exit_code_from_show(text, os.getpid(), os.environ.get("INVOCATION_ID"))
+
+def restart_plan():
+    """systemd: exit and let Restart= start the new code. Otherwise reload this process in place."""
+    if systemd_exit_code() is not None:
+        return "systemd"
+    if sys.executable:
+        return "reexec"
+    return "manual"
+
+def cloexec_all():
+    """Listening sockets must not survive a reload, or the new process cannot bind the same ports."""
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        names = [str(i) for i in range(3, 256)]
+    for name in names:
+        try:
+            fd = int(name)
+        except ValueError:
+            continue
+        if fd < 3:
+            continue
+        try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+            fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+        except OSError:
+            pass
+
+def close_listeners():
+    for rt in list(RUNTIMES):
+        srv = rt.get("srv")
+        if not srv:
+            continue
+        try: srv.server_close()
+        except Exception: pass
+    if DASH_SERVER is not None:
+        try: DASH_SERVER.server_close()
+        except Exception: pass
+
+def finish_restart():
+    if not _RESTART["go"]:
+        return
+    _RESTART["go"] = False
+    code = _RESTART["code"]
+    try:
+        close_listeners()
+        cloexec_all()
+        if code is not None:
+            print("update: exiting so the service supervisor can start v%s" % (read_version() or ""), flush=True)
+            os._exit(code)
+            return
+        print("update: reloading this process in place", flush=True)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print("restart failed:", e, file=sys.stderr, flush=True)
 
 def schedule_restart():
+    code = systemd_exit_code()
     def go():
-        time.sleep(RESTART_DELAY)
-        try:
-            print("update: restarting via systemctl --user restart %s" % SERVICE, flush=True)
-            subprocess.Popen(RESTART_ARGV, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print("restart failed:", e, file=sys.stderr, flush=True)
+        time.sleep(RESTART_DELAY)   # the browser has the answer before the ports close
+        _RESTART["code"] = code
+        _RESTART["go"] = True
+        if DASH_SERVER is not None:
+            DASH_SERVER.shutdown()   # main's serve_forever returns and finish_restart runs there
+        else:
+            finish_restart()
     t = threading.Thread(target=go, daemon=True)
     t.start()
     return t
@@ -1345,4 +1431,8 @@ if __name__ == "__main__":
         if PROXY_SOURCE: Proxy.SRC = "proxy" if PROXY_SOURCE == "ollama" else PROXY_SOURCE
         start_proxy(Proxy, Proxy.SRC, PROXY_PORT, (UP_HOST, UP_PORT))
     threading.Thread(target=runtimes_loop, daemon=True).start()
-    TS((DASH_BIND, DASH_PORT), Dash).serve_forever()
+    DASH_SERVER = TS((DASH_BIND, DASH_PORT), Dash)
+    try:
+        DASH_SERVER.serve_forever()
+    finally:
+        finish_restart()
