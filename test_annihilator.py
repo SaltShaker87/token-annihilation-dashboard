@@ -390,6 +390,31 @@ class GaugeTests(unittest.TestCase):
         self.assertIn("de=primed?Math.max(0,e-prevEst):0;primed=true;", ta.PAGE)
         self.assertIn("es.onopen=()=>{primed=false;", ta.PAGE)
 
+    def run_done(self, dones, primed=True):
+        # runs the page's real done-arrival line in node and returns what the gauge window received
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        p = ta.PAGE; i = p.index("if(primed){const r="); line = p[i:p.index("\n", i)]
+        js = "const performance={now:()=>1};let arr=[],secOut=0,primed=%s;for(const f of %s){%s}console.log(JSON.stringify({arr,secOut}))" % (
+            "true" if primed else "false", json.dumps(dones), line)
+        out = subprocess.run([node, "-e", js], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_non_streamed_request_moves_the_gauge_when_it_finishes(self):
+        # aider through vLLM is non-streamed: out_est stays 0, so the gauge read exactly 0 while the total climbed
+        r = self.run_done([{"in": 1222, "out": 62, "est": 0}])
+        self.assertEqual(r["arr"], [[1, 62]]); self.assertEqual(r["secOut"], 62)
+
+    def test_streamed_tokens_are_not_counted_twice(self):
+        r = self.run_done([{"out": 50, "est": 48}, {"out": 10, "est": 10}])
+        self.assertEqual(r["arr"], [[1, 2]])
+
+    def test_done_before_baseline_does_not_spike(self):
+        self.assertEqual(self.run_done([{"out": 500, "est": 0}], primed=False)["arr"], [])
+
 
 class Hold(http.server.BaseHTTPRequestHandler):
     """Upstream that reads the request, then waits, so a test can look at the live card mid-flight."""

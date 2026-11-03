@@ -226,8 +226,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                     eval_s = (t_last - t_first) * out / (out - 1)
                 new_ms = log_row(ts=t0, model=model, endpoint=path, inp=inp, out=out, dur=time.time() - t0, eval_s=eval_s, status=r.status, source=src)
                 with LIVE_LOCK:
-                    LIVE.pop(rid, None); live_bump()
-                    DONE.append((LIVE_VER[0], {"model": model, "endpoint": path, "in": inp or 0, "out": out or 0, "dur": round(time.time() - t0, 2), "eval_s": eval_s, "src": src, "ms": new_ms}))
+                    est = (LIVE.pop(rid, None) or {}).get("out_est", 0); live_bump()   # tokens the gauge already saw stream in
+                    DONE.append((LIVE_VER[0], {"model": model, "endpoint": path, "in": inp or 0, "out": out or 0, "est": est, "dur": round(time.time() - t0, 2), "eval_s": eval_s, "src": src, "ms": new_ms}))
                     del DONE[:-20]
             except Exception as e: print("parse error:", e, file=sys.stderr)
             finally:
@@ -835,6 +835,9 @@ function onMsg(m){streams=m.streams||[];
   const dd=D.days.find(x=>x[0]==D.today);if(dd){dd[1]+=f.in;dd[2]+=f.out}else D.days.unshift([D.today,f.in,f.out]);
   if(ST.trip){ST.trip.tin+=f.in;ST.trip.tout+=f.out;ST.trip.n++;if(f.eval_s&&f.out){ST.trip.ev_out+=f.out;ST.trip.ev_s+=f.eval_s}}
   for(const k of (f.ms||[]))celebrate(k);
+  // non-streamed requests (aider, most /v1 clients) show out_est 0 the whole time, so their tokens only exist here:
+  // count whatever the stream estimate did not already deliver as an arrival, or the gauge reads 0 while the total climbs
+  if(primed){const r=Math.max(0,(f.out||0)-(f.est||0));if(r){arr.push([performance.now(),r]);secOut+=r}}
   showDone(f)}
  if(m.done&&m.done.length){tables();renderTrip();nextMilestone();refreshSoon();if(T.t>mx){mx=T.t;paint()}}
  const e=streams.reduce((a,s)=>a+s.out_est,0),de=primed?Math.max(0,e-prevEst):0;primed=true;secOut+=de;   // the first message carries every token the open streams produced BEFORE this page connected; counting it as a 3 s arrival spiked the gauge (80 then settling at 30)
