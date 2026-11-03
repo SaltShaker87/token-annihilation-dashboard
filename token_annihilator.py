@@ -808,8 +808,8 @@ async function refreshNow(){try{ST=await(await fetch('api/stats?days='+rDays,{ca
 document.querySelectorAll('#seg button').forEach(b=>b.onclick=()=>setRange(+b.dataset.d,true));
 renderAll();setRange(rDays,rDays!=0);
 // state from SSE
-let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0,arr=[],primed=false;   // primed: false until the first SSE message after (re)connect sets the out_est baseline   // arr: [time, tokens] arrivals for the gauge
-const WIN=3000;   // gauge = tokens/sec over a trailing 3 s wall-clock window
+let curTps=0,hist=Array(60).fill(0),secOut=0,prevEst=0,arr=[],primed=false;   // primed: false until the first SSE message after (re)connect sets the out_est baseline   // arr: [start, end, tokens] for the gauge
+const WIN=60000,T0=performance.now(),TAU=6;let seeded=false;   // gauge = tokens/sec over a trailing 60 s wall-clock window: batched non-streamed requests land in lumps, a 3 s window made the needle jump up and down
 // Header robot: one image. The idle still is frame 0 of the animated webp. Swap only when the state changes, so an SSE tick does not restart the loop.
 const MASCOT_IDLE='static/mascot-idle.webp',MASCOT_ANIM='static/mascot-inhale.webp';
 let mascotOn=false,mascotHold=0;
@@ -837,11 +837,12 @@ function onMsg(m){streams=m.streams||[];
   for(const k of (f.ms||[]))celebrate(k);
   // non-streamed requests (aider, most /v1 clients) show out_est 0 the whole time, so their tokens only exist here:
   // count whatever the stream estimate did not already deliver as an arrival, or the gauge reads 0 while the total climbs
-  if(primed){const r=Math.max(0,(f.out||0)-(f.est||0));if(r){arr.push([performance.now(),r]);secOut+=r}}
+  // spread them over the request's own duration (start to finish) instead of one spike at completion
+  if(primed){const r=Math.max(0,(f.out||0)-(f.est||0));if(r){const t=performance.now();arr.push([t-Math.max(0,f.dur||0)*1000,t,r]);secOut+=r}}
   showDone(f)}
  if(m.done&&m.done.length){tables();renderTrip();nextMilestone();refreshSoon();if(T.t>mx){mx=T.t;paint()}}
  const e=streams.reduce((a,s)=>a+s.out_est,0),de=primed?Math.max(0,e-prevEst):0;primed=true;secOut+=de;   // the first message carries every token the open streams produced BEFORE this page connected; counting it as a 3 s arrival spiked the gauge (80 then settling at 30)
- if(de)arr.push([performance.now(),de]);prevEst=streams.length?e:0;est=e;
+ if(de){const t=performance.now();arr.push([t,t,de])}prevEst=streams.length?e:0;est=e;
  if(streams.length){const s=streams[streams.length-1];$('now').classList.remove('off','breathe');$('nowH').textContent=streams.length>1?`Now annihilating (${streams.length} at once!)`:'Now annihilating';$('nm').innerHTML=esc(s.model||'?')+(s.src?` <span class=lbs>on ${esc(s.src)}</span>`:'');$('ni').textContent='counting...';$('no').textContent=s.wait?'waiting for the full answer...':'~'+fmt(s.out_est);$('ne').textContent=s.elapsed.toFixed(1)+' s';$('idle').textContent=''}
  draw();mascotSync()}
 function showDone(f){$('nowH').textContent='Last annihilation complete';$('nm').innerHTML=esc(f.model||'?')+(f.src?` <span class=lbs>on ${esc(f.src)}</span>`:'');$('ni').textContent=fmt(f.in);$('no').textContent=fmt(f.out);$('ne').textContent=f.dur.toFixed(1)+' s';
@@ -856,13 +857,18 @@ function draw(){const live=streams.length>0,total=(rDays?RG.tin+RG.tout:tin+tout
  if(!live){$('now').classList.add('off','breathe');if(!$('idle').textContent)$('idle').textContent=IDLE[idleI++%IDLE.length]}}
 // animation loop: only gauge easing + sparkline; paused when hidden
 let last=performance.now(),lastSec=last,running=!document.hidden;
+// tokens inside [t-WIN, t]: each entry counts the share of its [start,end] span that falls in the window (instant ones count whole)
+// the window never reaches back before page load (T0), so nothing from before the tab opened counts
+function winTok(a,t,lo){let n=0;for(const[s,e,r]of a){if(e<=lo)continue;n+=e>s?r*Math.max(0,Math.min(e,t)-Math.max(s,lo))/(e-s):r}return n}
 function frame(t){if(!running)return;const gap=(t-last)/1000,dt=Math.min(.2,gap);last=t;
  // tokens/sec over the REAL elapsed time: rAF can be throttled to well under 1 fps, so a "1 s" bucket may span many seconds
  if(t-lastSec>=1000){const el=(t-lastSec)/1000;lastSec=t;hist.push(secOut/el);hist.shift();secOut=0;const m=Math.max(1,...hist);$('spk').setAttribute('points',hist.map((v,i)=>`${i*4},${38-v/m*34}`).join(' '))}
  // Rate over a trailing wall-clock window, not the last 1 s bucket or "is a stream open right now": SSE ticks land unevenly
  // in buckets and back-to-back requests leave brief no-stream gaps, which made the target flip to 0 and back (the sweep).
- while(arr.length&&t-arr[0][0]>WIN)arr.shift();
- const target=arr.reduce((a,x)=>a+x[1],0)/(WIN/1000);const k=gap>2?1:Math.min(1,dt*3);   // after a long stall, snap instead of sweeping
+ arr=arr.filter(x=>x[1]>t-WIN);   // finish times are not in order (a long request can end after a short one), so filter instead of shift
+ const lo=Math.max(t-WIN,T0),target=winTok(arr,t,lo)/(Math.max(Math.min(5000,WIN),t-lo)/1000);   // divide by the real window, never by a tiny time since load
+ if(!seeded&&target>0){seeded=true;curTps=target}   // seed the smoothing from the first real windowed value
+ const k=gap>2?1:Math.min(1,dt/TAU);   // ~6 s easing on top of the window evens out batch completions   // after a long stall, snap instead of sweeping
  const n=curTps+(target-curTps)*k;
  curTps=Math.abs(n)<.05?0:n;   // always advance the eased value: gating this on a per-frame step >.05 froze the gauge at ~1-2 tok/s when idle on fast displays (step = curTps*dt*3 drops under .05)
  const tx=curTps.toFixed(1);if($('tps').textContent!==tx){$('tps').textContent=tx;$('arc').setAttribute('stroke-dasharray',Math.min(100,curTps)+' 100')}   // touch the DOM only when the shown value changes
