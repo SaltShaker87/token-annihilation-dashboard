@@ -861,7 +861,8 @@ function frame(t){if(!running)return;const gap=(t-last)/1000,dt=Math.min(.2,gap)
  while(arr.length&&t-arr[0][0]>WIN)arr.shift();
  const target=arr.reduce((a,x)=>a+x[1],0)/(WIN/1000);const k=gap>2?1:Math.min(1,dt*3);   // after a long stall, snap instead of sweeping
  const n=curTps+(target-curTps)*k;
- if(Math.abs(n-curTps)>.05||Math.abs(n)<.05&&curTps!==0){curTps=Math.abs(n)<.05?0:n;$('tps').textContent=curTps.toFixed(1);$('arc').setAttribute('stroke-dasharray',Math.min(100,curTps)+' 100')}
+ curTps=Math.abs(n)<.05?0:n;   // always advance the eased value: gating this on a per-frame step >.05 froze the gauge at ~1-2 tok/s when idle on fast displays (step = curTps*dt*3 drops under .05)
+ const tx=curTps.toFixed(1);if($('tps').textContent!==tx){$('tps').textContent=tx;$('arc').setAttribute('stroke-dasharray',Math.min(100,curTps)+' 100')}   // touch the DOM only when the shown value changes
  requestAnimationFrame(frame)}
 document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running){last=lastSec=performance.now();secOut=0;requestAnimationFrame(frame)}});   // drop tokens counted while hidden from the sparkline bucket; the gauge window is wall-clock, so it shows the real current rate
 setInterval(()=>{if(!streams.length&&!document.hidden)$('idle').textContent=IDLE[idleI++%IDLE.length]},20000);

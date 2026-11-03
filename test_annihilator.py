@@ -297,6 +297,40 @@ class MascotTests(unittest.TestCase):
 
 
 
+class GaugeDecayTests(unittest.TestCase):
+    # runs the page's real gauge animation loop in node with a fake clock and DOM
+    def run_gauge(self, start_tps, arrivals, hz, secs):
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        p = ta.PAGE
+        js = p[p.index("let last=performance.now()"):p.index("document.addEventListener('visibilitychange'")]
+        stub = """let NOW=0;const performance={now:()=>NOW};const document={hidden:false};const requestAnimationFrame=()=>{};
+const E={};const $=id=>E[id]||(E[id]={textContent:'',setAttribute(){}});
+let curTps=%f,hist=Array(60).fill(0),secOut=0,arr=[];const WIN=3000;
+""" % start_tps
+        drive = """const A=%s,step=1000/%d;let i=0;for(let t=step;t<=%d;t+=step){while(i<A.length&&A[i][0]<=t){arr.push([A[i][0],A[i][1]]);i++}NOW=t;frame(t)}
+console.log(JSON.stringify({shown:$('tps').textContent,cur:curTps}))""" % (json.dumps(arrivals), hz, secs * 1000)
+        out = subprocess.run([node, "-e", stub + js + drive], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_idle_gauge_decays_to_zero(self):
+        # a finished request leaves the gauge at ~1.6 tok/s; with no new tokens it must reach 0 on any refresh rate
+        for hz in (30, 60, 120, 144, 240):
+            r = self.run_gauge(1.6, [], hz, 10)
+            self.assertEqual(r["shown"], "0.0", hz)
+            self.assertEqual(r["cur"], 0, hz)
+
+    def test_gauge_tracks_steady_load(self):
+        # 10 tokens every 100 ms = 100 tok/s
+        arrivals = [[t, 10] for t in range(100, 10001, 100)]
+        for hz in (60, 144):
+            r = self.run_gauge(0, arrivals, hz, 10)
+            self.assertAlmostEqual(float(r["shown"]), 100, delta=5)
+
+
 class OdometerTests(unittest.TestCase):
     # runs the page's real odometer code in node against a fake DOM and reads back what would be drawn
     def run_odo(self, seq, width=900):
