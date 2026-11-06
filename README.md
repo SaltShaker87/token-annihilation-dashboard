@@ -14,7 +14,7 @@ Backends supported, each with its own source label:
 |---|---|---|
 | **Ollama** | Transparent proxy (default `:11435` -> `:11434`) | Ollama |
 | **vLLM** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | vLLM |
-| **llama.cpp** (`llama-server`) | Read-only tail of the server log (`LLAMA_LOG`) and/or the OpenAI-compatible proxy | llama.cpp |
+| **llama.cpp** (`llama-server`) | Read-only read of llama-server's log. Default file: `~/pixpilot/run/server.log`. The 8081 proxy is optional and stays off while a log path is set | llama.cpp |
 | **NVIDIA NIM / NeMo, TensorRT-LLM, Triton (OpenAI front end), SGLang, LM Studio** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | NVIDIA NIM, NeMo, TensorRT-LLM, ... |
 | **ONNX Runtime** (Foundry Local, onnxruntime-genai OpenAI servers) | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | ONNX Runtime |
 
@@ -47,7 +47,7 @@ python3 token_annihilator.py            # try it in the foreground
 
 Open `http://<your-tailscale-ip>:11480` (it binds to your Tailscale IP if `tailscale` is installed, else `127.0.0.1`).
 
-Run it as a systemd user service (no sudo). Edit the `Environment=` lines in the unit file first if you use vLLM or llama.cpp:
+Run it as a systemd user service (no sudo). Edit the `Environment=` lines in the unit file first if you use vLLM, or if llama-server's log is not `~/pixpilot/run/server.log`:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -124,20 +124,24 @@ The proxy reads the `usage` field from every response. For streaming requests it
 
 ### llama.cpp
 
-Two options, use either or both:
+Counted from llama-server's own log. Nothing sits in front of the server, and the server does not have to be running.
 
-1. **Log tail (zero contact with the server).** Save llama-server's output to a file and point `LLAMA_LOG` at it:
+By default the dashboard reads `~/pixpilot/run/server.log` (Locally's harness writes llama-server's output there). A missing file or a missing folder is fine: the dashboard keeps running and starts counting when the file appears. It only reads the file. It does not write it, lock it, or talk to port 8080.
 
-   ```bash
-   llama-server -m model.gguf --port 8080 2>&1 | tee ~/llama_server.log
-   LLAMA_LOG=~/llama_server.log python3 token_annihilator.py
-   ```
+The model name is the GGUF file name from the log's `loading model '...'` line. Prompt tokens are the `prompt eval time` count (tokens the server actually processed). Answer tokens are the `eval time` count. The `stop processing: n_tokens` figure is the slot's context size, not the size of that request, so it is not used as the prompt.
 
-   The file is polled every `LLAMA_POLL_S` seconds (default 15), and the model name comes from the GGUF file name. To import a log that already exists, run `python3 token_annihilator.py --llama-backfill` once.
+The file is checked every `LLAMA_POLL_S` seconds once caught up (default 15). A long log is read in pieces (`LLAMA_READ_MAX` bytes, default 2 MB) so catching up does not stall the page. Reading the same log again does not count twice, including after a restart. If the file is replaced or rotated (`server.log` renamed to `server.log.1`), the unread tail of the old file is finished and the new file is read from the start. A compressed `.gz` rotation is not read.
 
-2. **Counting proxy**, opened automatically on **8081** once llama-server answers on 8080 (not when `LLAMA_LOG` is set), then use port 8081.
+Different log path, or turn the tail off:
 
-Don't count the same server both ways at once, or its tokens are counted twice.
+```bash
+LLAMA_LOG=~/llama_server.log python3 token_annihilator.py
+LLAMA_LOG= python3 token_annihilator.py          # tail off
+```
+
+To import a log in one shot: `python3 token_annihilator.py --llama-backfill`.
+
+**Counting proxy (optional).** With the log tail on, the automatic proxy on **8081** stays off so the same requests are not counted twice. Set `LLAMA_LOG` empty (and do not set `OPENAI_PROXIES`) to get the old behaviour: a proxy opens on **8081** once llama-server answers on 8080, and clients must use 8081. Don't point clients at 8081 while a log tail of that same server is also on.
 
 Proxy pattern in practice: llama-server stays on **8080** (its start line and any health checks keep using 8080), and only the clients that send prompts move to **8081**, for example `--base-url http://127.0.0.1:8081/v1`. Streaming passes straight through (about one token per chunk), and the proxy adds only a few percent to total request time. If you want the proxy fixed instead of auto-detected, list it yourself (optional; this replaces the automatic vLLM proxy too, so add `vllm:8001=127.0.0.1:8000` to the list if you also run vLLM):
 
@@ -159,9 +163,9 @@ Raw Triton KServe (`/v2/models/.../generate`) and in-process ONNX Runtime return
 
 ### Several runtimes at once
 
-The Ollama proxy (11435) starts by default. The vLLM (8001) and llama.cpp (8081) proxies open on their own once a real vLLM or llama-server answers on 8000 / 8080, so running a big vLLM model and a small Ollama model side by side needs no config, and an unrelated app on 8000 or 8080 is never proxied or exposed. Setting `OPENAI_PROXIES` replaces those automatic proxies with exactly what you list, started right away with no detection (`OPENAI_PROXIES=` with nothing after it turns them all off). The 11435 proxy labels itself by whatever actually answers upstream (if you point `UPSTREAM_PORT` at vLLM it says vLLM, not Ollama); force it with `PROXY_SOURCE`.
+The Ollama proxy (11435) starts by default. The vLLM proxy (8001) opens on its own once vLLM answers on 8000. The llama.cpp proxy (8081) opens on its own only when the log tail is off (`LLAMA_LOG` empty) and llama-server answers on 8080. An unrelated app on 8000 or 8080 is never proxied. Setting `OPENAI_PROXIES` replaces those automatic proxies with exactly what you list, started right away with no detection (`OPENAI_PROXIES=` with nothing after it turns them all off). The 11435 proxy labels itself by whatever actually answers upstream (if you point `UPSTREAM_PORT` at vLLM it says vLLM, not Ollama); force it with `PROXY_SOURCE`.
 
-**Only traffic that goes through a proxy is counted.** Requests sent straight to the real servers (Ollama on 11434, llama-server on 8080, vLLM on 8000) bypass the dashboard and are not counted, unless you use the llama.cpp log tail.
+**Ollama and vLLM are counted only when the request goes through their proxy.** llama-server on 8080 is counted from its log, with no proxy. Requests sent straight to Ollama on 11434 or vLLM on 8000 still bypass the dashboard.
 
 Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAMACPP_*` settings still work, and rows it saved are relabelled from Ollama to their real runtime the first time this version starts.
 
@@ -173,13 +177,14 @@ Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAM
 | `PROXY_BIND` / `PROXY_PORT` | `0.0.0.0` / `11435` | Ollama proxy listen address |
 | `UPSTREAM_HOST` / `UPSTREAM_PORT` | `127.0.0.1` / `11434` | Where Ollama lives |
 | `OLLAMA_PROXY` | `1` | `0` disables the Ollama proxy |
-| `OPENAI_PROXIES` | unset: `vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080`, each opened only once that runtime is detected | `source:listen_port=upstream_host:port`, comma-separated, started right away. Set empty for none |
+| `OPENAI_PROXIES` | unset: vLLM `8001` -> `127.0.0.1:8000`, and llama.cpp `8081` -> `127.0.0.1:8080` only when `LLAMA_LOG` is empty. Each opens once that runtime is detected | `source:listen_port=upstream_host:port`, comma-separated, started right away. Set empty for none |
 | `PROXY_SOURCE` | detected | Force the label of the 11435 proxy (`ollama`, `vllm`, ...) |
 | `ENGINES` | `ollama,vllm,llamacpp` | Older-build switch; used only when `OPENAI_PROXIES` is unset |
 | `INJECT_USAGE` | `1` | Ask streaming `/v1` requests to include usage |
-| `LLAMA_LOG` | empty (off) | llama-server log file to tail |
-| `LLAMA_POLL_S` | `15` | Log poll interval, seconds |
-| `LLAMA_MODEL` | `llama.cpp` | Model name if the log has no load line |
+| `LLAMA_LOG` | `~/pixpilot/run/server.log` | llama-server log to read. Empty turns the tail off and brings back the automatic 8081 proxy. A missing file is fine |
+| `LLAMA_POLL_S` | `15` | Seconds between reads once caught up |
+| `LLAMA_READ_MAX` | `2000000` | Max new log bytes read per pass, so a big file cannot stall the page |
+| `LLAMA_MODEL` | `llama.cpp` | Model name until the log says which GGUF was loaded |
 | `LLAMA_STARTS` | empty | Optional comma-separated epoch start times for exact `--llama-backfill` timestamps |
 | `STATS_DB` | `./stats.db` | SQLite file |
 

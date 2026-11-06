@@ -2,7 +2,7 @@
 """Token Annihilation Dashboard: transparent token-counting proxies (Ollama, vLLM, llama.cpp / any
 OpenAI-compatible server) + llama.cpp log tailing + a tiny, gloriously dramatic dashboard. Stdlib only.
 MIT licensed. https://github.com/SaltShaker87/token-annihilation-dashboard"""
-import ast, fcntl, http.client, http.server, json, os, re, sqlite3, subprocess, sys, threading, time, html, urllib.error, urllib.request
+import ast, fcntl, http.client, http.server, json, os, re, sqlite3, stat, subprocess, sys, threading, time, html, urllib.error, urllib.request
 from datetime import datetime
 from socketserver import ThreadingMixIn
 
@@ -284,7 +284,7 @@ def proxy_specs():
     e, out = os.environ.get, []
     if "vllm" in ENGINES:
         out.append("vllm:%s=%s:%s" % (e("VLLM_PROXY_PORT", "8001"), e("VLLM_UPSTREAM_HOST", "127.0.0.1"), e("VLLM_UPSTREAM_PORT", "8000")))
-    if "llamacpp" in ENGINES and not LLAMA_LOG:   # tailing the log already counts it; don't count twice
+    if "llamacpp" in ENGINES and not LLAMA_LOG:   # a log path already counts llama.cpp; don't also open :8081
         out.append("llamacpp:%s=%s:%s" % (e("LLAMACPP_PROXY_PORT", "8081"), e("LLAMACPP_UPSTREAM_HOST", "127.0.0.1"), e("LLAMACPP_UPSTREAM_PORT", "8080")))
     return ",".join(out)
 
@@ -922,94 +922,418 @@ checkUpd();
 draw();requestAnimationFrame(frame);
 </script></body></html>"""
 
-# --- llama.cpp: read-only tail of llama-server's own log (e.g. `llama-server ... 2>&1 | tee server.log`).
-# Never connects to the server. Set LLAMA_LOG to the log path to enable; empty = disabled. ---
-LLAMA_LOG = os.path.expanduser(os.environ.get("LLAMA_LOG", ""))
+# --- llama.cpp: read llama-server's own log. Never connects to the server, never writes the file.
+# LLAMA_LOG unset -> ~/pixpilot/run/server.log. LLAMA_LOG empty -> off (the automatic :8081 proxy returns).
+# A missing file or directory is normal and does nothing. llama-server does not have to be running.
+#
+# Counts come from the slot timing lines llama-server prints when a request finishes (info log, the default).
+# Sample the parser was built from (llama.cpp server-context.cpp print_timings / release, plus a real server log):
+#   0.00.018.151 I srv    load_model: loading model '/models/Qwen3.6-27B-Q4_K_M.gguf'
+#   1482.46.938.685 I slot print_timing: id  3 | task 232040 | prompt eval time =     897.72 ms /   467 tokens ( ... )
+#   1482.46.938.692 I slot print_timing: id  3 | task 232040 |        eval time =   24572.14 ms /   189 tokens ( ... )
+#   1482.46.938.693 I slot print_timing: id  3 | task 232040 |       total time =   25469.85 ms /   656 tokens
+#   1482.46.940.473 I slot      release: id  3 | task 232040 | stop processing: n_tokens = 28639, truncated = 0
+# Prompt tokens are the "prompt eval" count (tokens actually processed). Output tokens are the "eval" count.
+# The release line's n_tokens is the slot context size, not the request, so it is not used as the prompt.
+# Lines may carry a clock prefix (minutes.seconds.millis.micros), ANSI colour, or a harness prefix.
+# "generation eval time = ... / N runs" (older servers) is accepted too. ---
+DEFAULT_LLAMA_LOG = os.path.expanduser(os.path.join("~", "pixpilot", "run", "server.log"))
+
+def resolve_llama_log(value=None, present=None):
+    """Unset uses the pixpilot default. An explicit empty value turns the tail off."""
+    if present is None:
+        present = "LLAMA_LOG" in os.environ
+        value = os.environ.get("LLAMA_LOG", "")
+    if not present:
+        return DEFAULT_LLAMA_LOG
+    return os.path.expanduser(value or "")
+
+LLAMA_LOG = resolve_llama_log()
 LLAMA_POLL_S = int(os.environ.get("LLAMA_POLL_S", 15))
-LL_T = re.compile(rb'^(\d+)\.(\d\d)\.(\d{3})\.(\d{3}) ')
-LL_PE = re.compile(rb'task (\d+) \| prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens')
-LL_EV = re.compile(rb'task (\d+) \|\s+eval time =\s*([\d.]+) ms /\s*(\d+) tokens')
-LL_TOT = re.compile(rb'task (\d+) \|\s+total time =\s*([\d.]+) ms')
-LL_REL = re.compile(rb'task (\d+) \| stop processing: n_tokens = (\d+)')
-LL_LOAD = re.compile(rb"load_model: loading model '([^']+)'")
+LLAMA_READ_MAX = int(os.environ.get("LLAMA_READ_MAX", 2000000))   # bytes of new log per pass; the rest waits
+LLAMA_LINE_MAX = 1048576
+LLAMA_BEHIND = [False]   # more unread bytes after this pass; the loop comes back quickly
+_LLAMA_KEEP = ("lo", "rel", "sess", "model", "pe_ms", "pe_n", "ev_ms", "ev_n", "tot_ms", "tot_n", "n_tok")
+_ANSI = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
+_LL_T = re.compile(rb"(\d+)\.(\d{2})\.(\d{3})\.(\d{3})(?:\s|$)")
+LL_PE = re.compile(rb"prompt eval time\s*=\s*([\d.]+) ms /\s*(\d+) tokens")
+LL_EV = re.compile(rb"(?<!prompt )(?:generation )?eval time\s*=\s*([\d.]+) ms /\s*(\d+) (?:tokens|runs)")
+LL_TOT = re.compile(rb"total time\s*=\s*([\d.]+) ms(?:\s*/\s*(\d+) tokens)?")
+LL_REL = re.compile(rb"stop processing:\s*n_tokens\s*=\s*(\d+)")
+LL_LOAD = re.compile(rb"loading model '([^']+)'")
+LL_LOAD2 = re.compile(rb"loading model (\S+\.gguf)", re.IGNORECASE)
 
-def ll_state(c, path, ino=None, off=None):
-    c.execute("CREATE TABLE IF NOT EXISTS llama_state(path TEXT PRIMARY KEY, ino INTEGER, off INTEGER)")
-    if ino is None:
-        r = c.execute("SELECT ino, off FROM llama_state WHERE path=?", (path,)).fetchone()
-        return r if r else (None, 0)
-    c.execute("INSERT OR REPLACE INTO llama_state(path,ino,off) VALUES(?,?,?)", (path, ino, off))
+def _ll_ensure(c):
+    c.execute("""CREATE TABLE IF NOT EXISTS llama_state(
+        path TEXT PRIMARY KEY, ino INTEGER, off INTEGER, gen INTEGER DEFAULT 0,
+        dev INTEGER, model TEXT, mark TEXT, pend TEXT)""")
+    have = {r[1] for r in c.execute("PRAGMA table_info(llama_state)")}
+    for name, decl in (("gen", "INTEGER DEFAULT 0"), ("dev", "INTEGER"), ("model", "TEXT"), ("mark", "TEXT"), ("pend", "TEXT")):
+        if name not in have:
+            c.execute("ALTER TABLE llama_state ADD COLUMN %s %s" % (name, decl))
 
-def llama_scan(path=None, anchors=None):
-    """Read new llama-server log lines and log one row per finished request. anchors: optional list of
-    session start epochs (one per server start in the file); otherwise times are inferred from the file mtime."""
-    path = path or LLAMA_LOG
-    if not path: return 0
-    try: st = os.stat(path)
-    except OSError: return 0
-    c = db(); ino, off = ll_state(c, path); c.close()
-    if ino != st.st_ino or st.st_size < off: off = 0
-    if st.st_size == off: return 0
-    with open(path, "rb") as f:
-        f.seek(off); data = f.read()
-    end = data.rfind(b"\n")
-    if end < 0: return 0
-    data = data[:end + 1]
-    sess, model, pend, rows, pos, last_rel = 0, os.environ.get("LLAMA_MODEL", "llama.cpp"), {}, [], off, {}
-    models = {}
-    for line in data.splitlines(keepends=True):
-        lo = pos; pos += len(line)
-        m = LL_T.match(line)
-        rel = (int(m.group(1)) * 60 + int(m.group(2)) + int(m.group(3)) / 1e3 + int(m.group(4)) / 1e6) if m else None
-        lm = LL_LOAD.search(line)
-        if lm:
-            if rows or pend: sess += 1
-            model = os.path.splitext(os.path.basename(lm.group(1).decode("utf-8", "replace")))[0]
+def _ll_load(path):
+    with lock:
+        c = db(); _ll_ensure(c)
+        r = c.execute("SELECT ino, off, gen, dev, model, mark, pend FROM llama_state WHERE path=?", (path,)).fetchone()
+        c.close()
+    if not r:
+        return {"ino": None, "off": 0, "gen": 0, "dev": None, "model": None, "mark": None, "pend": {}}
+    pend = {}
+    if r[6]:
+        try:
+            loaded = json.loads(r[6])
+            if isinstance(loaded, dict):
+                pend = {str(k): v for k, v in loaded.items() if isinstance(v, dict)}
+        except Exception:
             pend = {}
-        models[sess] = model
-        if rel is not None: last_rel[sess] = rel
-        for rx, k in ((LL_PE, "pe"), (LL_EV, "ev"), (LL_TOT, "tot")):
-            x = rx.search(line)
-            if x: pend.setdefault(x.group(1), {})[k] = x.groups()[1:]; break
-        else:
-            x = LL_REL.search(line)
-            if x and x.group(1) in pend and "ev" in pend[x.group(1)]:
-                t = pend.pop(x.group(1)); ev_ms, ev = float(t["ev"][0]), int(t["ev"][1])
-                rows.append({"sess": sess, "rel": rel, "model": models[sess], "out": ev, "inp": max(0, int(x.group(2)) - ev),
-                             "dur": float(t["tot"][0]) / 1e3 if "tot" in t else None, "eval_s": ev_ms / 1e3, "lo": lo, "end": pos})
-    if not rows: return 0
-    # session anchors: explicit (backfill) or chained back from file mtime (live)
-    if anchors:
-        base = len(anchors) - 1 - sess
-        anc = {s: anchors[base + s] for s in range(sess + 1) if 0 <= base + s < len(anchors)}
+    return {"ino": r[0], "off": r[1] or 0, "gen": r[2] or 0, "dev": r[3], "model": r[4], "mark": r[5], "pend": pend}
+
+def _ll_save(path, ino, off, gen, dev, model, mark, pend):
+    clean = {}
+    for k, item in list(pend.items())[:200]:
+        if isinstance(item, dict):
+            clean[str(k)] = {kk: item[kk] for kk in _LLAMA_KEEP if kk in item}
+    with lock:
+        c = db(); _ll_ensure(c)
+        c.execute("INSERT OR REPLACE INTO llama_state(path,ino,off,gen,dev,model,mark,pend) VALUES(?,?,?,?,?,?,?,?)",
+                  (path, ino, off, gen, dev, model, mark, json.dumps(clean)))
+        c.commit(); c.close()
+
+def _llama_text(line):
+    """Drop ANSI colour and, if the line is JSON, keep the message llama-server was logging."""
+    line = _ANSI.sub(b"", line).strip()
+    if line.startswith(b"{"):
+        try:
+            obj = json.loads(line.decode("utf-8", "replace"))
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            msg = obj.get("msg")
+            if msg is None:
+                msg = obj.get("message") or ""
+            if not isinstance(msg, str):
+                msg = str(msg)
+            tid = obj.get("id_task", obj.get("task_id"))
+            if tid is not None and "task " not in msg and "id_task=" not in msg:
+                msg = "task %s | %s" % (tid, msg)
+            line = msg.encode("utf-8", "replace")
+    return line
+
+def _llama_rel(text):
+    """llama.cpp clock: minutes.seconds.millis.micros since the server started. None if this line has none."""
+    m = _LL_T.search(text)
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2)) + int(m.group(3)) / 1e3 + int(m.group(4)) / 1e6
+
+def _llama_model_name(raw):
+    name = raw.decode("utf-8", "replace").strip().strip("'\"")
+    name = name.replace("\\", "/").split("/")[-1]
+    if name.lower().endswith(".gguf"):
+        name = name[:-5]
+    return name or None
+
+def _task_id(text):
+    m = re.search(rb"\btask (\d+)", text) or re.search(rb"id_task=(\d+)", text)
+    return m.group(1).decode() if m else None
+
+def _read_only(path, off, want):
+    """Read bytes at off. O_RDONLY so a bug here cannot truncate the server's log. want is a positive size."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.lseek(fd, off, os.SEEK_SET)
+        blob = b""
+        while len(blob) < want:
+            chunk = os.read(fd, min(65536, want - len(blob)))
+            if not chunk:
+                break
+            blob += chunk
+        if b"\n" not in blob and len(blob) < LLAMA_LINE_MAX:
+            while b"\n" not in blob and len(blob) < LLAMA_LINE_MAX:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                blob += chunk
+        return blob
+    finally:
+        os.close(fd)
+
+def _tail_rel(path, size):
+    if size <= 0:
+        return None
+    try:
+        tail = _read_only(path, max(0, size - 16384), min(size, 16384))
+    except OSError:
+        return None
+    last = None
+    for line in tail.splitlines():
+        rel = _llama_rel(_llama_text(line))
+        if rel is not None:
+            last = rel
+    return last
+
+def _mark_ok(path, off, mark):
+    """False only when we could read the bytes before off and they are not the ones we saved.
+    A changed prefix means the file was replaced in place (copytruncate) even if it is already longer than off."""
+    if not mark or off <= 0:
+        return True
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return True
+    try:
+        start = max(0, off - 32)
+        os.lseek(fd, start, os.SEEK_SET)
+        got = os.read(fd, off - start)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return got.hex() == mark
+
+def _rotated_file(path, ino, dev):
+    """logrotate's rename leaves the old inode beside the new file (server.log.1). None if it is already gone."""
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    here = os.path.abspath(path)
+    for name in names:
+        if name != base and not name.startswith(base + "."):
+            continue
+        cand = os.path.join(directory, name)
+        if os.path.abspath(cand) == here:
+            continue
+        try:
+            st = os.stat(cand)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_ino == ino and (dev is None or st.st_dev == dev):
+            return cand, st
+    return None
+
+def _dedupe(ino, gen, lo):
+    # gen 0 keeps the old key (llamacpp:inode:offset) so a dashboard upgrade does not count the same lines again.
+    if gen:
+        return "llamacpp:%d:%d:%d" % (ino, gen, lo)
+    return "llamacpp:%d:%d" % (ino, lo)
+
+def _llama_ready(item):
+    return "ev_n" in item and ("tot_ms" in item or "n_tok" in item)
+
+def _llama_row(item, ino, gen, st, end_rel, anchors):
+    ev_n = int(item["ev_n"])
+    ev_ms = float(item.get("ev_ms") or 0.0)
+    if "pe_n" in item:
+        inp = int(item["pe_n"])
+    elif "tot_n" in item:
+        inp = max(0, int(item["tot_n"]) - ev_n)
+    elif "n_tok" in item:
+        inp = max(0, int(item["n_tok"]) - ev_n)
     else:
-        anc, t = {}, st.st_mtime
-        for s in range(sess, -1, -1):
-            anc[s] = t - last_rel.get(s, 0); t = anc[s]
-    new_tot, fin = [], []
+        inp = 0
+    if inp <= 0 and ev_n <= 0:
+        return None
+    rel = item.get("rel")
+    if anchors:
+        s = int(item.get("sess") or 0)
+        ts = (anchors[s] if s < len(anchors) else anchors[-1]) + (rel or 0)
+    elif rel is not None and end_rel is not None and rel <= end_rel + 1:
+        ts = st.st_mtime - end_rel + rel
+    else:
+        ts = st.st_mtime
+    dur = float(item["tot_ms"]) / 1000.0 if "tot_ms" in item else None
+    return {"ts": min(ts, time.time()), "model": item.get("model") or os.environ.get("LLAMA_MODEL", "llama.cpp"),
+            "inp": inp, "out": ev_n, "dur": dur, "eval_s": ev_ms / 1000.0, "lo": int(item["lo"]),
+            "dedupe": _dedupe(ino, gen, int(item["lo"]))}
+
+def _parse_llama(data, base, pend, model, ino, gen, st, end_rel, anchors):
+    if not model:
+        model = os.environ.get("LLAMA_MODEL", "llama.cpp")
+    rows, pos, sess, seen_load, prev_rel, nlines = [], 0, 0, False, None, 0
+    for raw in data.splitlines(keepends=True):
+        lo = base + pos
+        pos += len(raw)
+        nlines += 1
+        if nlines % 5000 == 0:
+            time.sleep(0.01)
+        text = _llama_text(raw)
+        if not text:
+            continue
+        try:
+            rel = _llama_rel(text)
+            if rel is not None and prev_rel is not None and rel + 1 < prev_rel:
+                sess += 1
+            if rel is not None:
+                prev_rel = rel
+            lm = LL_LOAD.search(text) or LL_LOAD2.search(text)
+            if lm:
+                name = _llama_model_name(lm.group(1))
+                if name:
+                    model = name
+                if seen_load:
+                    sess += 1
+                seen_load = True
+                continue
+            pe, ev, tot, reln = LL_PE.search(text), LL_EV.search(text), LL_TOT.search(text), LL_REL.search(text)
+            if not (pe or ev or tot or reln):
+                continue
+            tid = _task_id(text)
+            if not tid:
+                continue
+            item = pend.get(tid)
+            if item is None:
+                item = {"lo": lo, "rel": rel, "sess": sess, "model": model}
+                pend[tid] = item
+            elif rel is not None:
+                item["rel"] = rel
+            if pe:
+                item["pe_ms"], item["pe_n"] = float(pe.group(1)), int(pe.group(2))
+            elif ev:
+                item["ev_ms"], item["ev_n"] = float(ev.group(1)), int(ev.group(2))
+            elif tot:
+                item["tot_ms"] = float(tot.group(1))
+                if tot.group(2) is not None:
+                    item["tot_n"] = int(tot.group(2))
+            elif reln:
+                item["n_tok"] = int(reln.group(1))
+            if _llama_ready(item):
+                row = _llama_row(item, ino, gen, st, end_rel, anchors)
+                pend.pop(tid, None)
+                if row:
+                    rows.append(row)
+        except ValueError:
+            continue
+    if len(pend) > 200:
+        for k in sorted(pend, key=lambda i: pend[i].get("lo") or 0)[:len(pend) - 200]:
+            pend.pop(k, None)
+    return rows, pend, model
+
+def _publish_fresh(fin):
+    """Hand only just-finished requests to the live gauge. A catch-up of an old run stays in the database."""
+    now = time.time()
+    fresh = [x for x in fin if x["ts"] >= now - 120]
+    if not fresh:
+        return
+    with LIVE_LOCK:
+        for x in fresh[-20:]:
+            live_bump()
+            DONE.append((LIVE_VER[0], {"model": x["model"], "endpoint": "llama-server", "in": x["in"], "out": x["out"],
+                                       "dur": x["dur"], "eval_s": x["eval_s"], "src": "llamacpp", "ms": x["ms"]}))
+        del DONE[:-20]
+
+def _llama_consume(logical, read_path, st, state, cap, anchors):
+    """Read one chunk of read_path and remember it under logical (the path LLAMA_LOG names)."""
+    ino, off, gen = state["ino"], state["off"] or 0, state["gen"] or 0
+    dev, model, mark, pend = state["dev"], state["model"], state["mark"], dict(state["pend"] or {})
+    if ino is None:
+        ino, dev = st.st_ino, st.st_dev
+    rewritten = ino == st.st_ino and off > st.st_size
+    if not rewritten and ino == st.st_ino and off > 0 and not _mark_ok(read_path, off, mark):
+        rewritten = True
+    if rewritten:
+        gen, off, pend, mark = gen + 1, 0, {}, None
+    if off > st.st_size:
+        off = 0
+    if st.st_size <= off:
+        _ll_save(logical, ino, off, gen, dev, model, mark, pend)
+        LLAMA_BEHIND[0] = False
+        return 0, model
+    want = st.st_size - off if not cap else min(st.st_size - off, cap)
+    try:
+        blob = _read_only(read_path, off, max(1, want))
+    except OSError:
+        LLAMA_BEHIND[0] = False
+        return 0, model
+    end = blob.rfind(b"\n") + 1
+    if end <= 0:
+        if len(blob) >= LLAMA_LINE_MAX:
+            off += len(blob)
+            _ll_save(logical, st.st_ino, off, gen, st.st_dev, model, None, {})
+            LLAMA_BEHIND[0] = off < st.st_size
+        else:
+            LLAMA_BEHIND[0] = False
+        return 0, model
+    data = blob[:end]
+    new_off = off + end
+    end_rel = _tail_rel(read_path, st.st_size)
+    rows, pend, model = _parse_llama(data, off, pend, model, st.st_ino, gen, st, end_rel, anchors)
+    fin, n = [], 0
     for r in rows:
-        ts = anc.get(r["sess"], time.time()) + (r["rel"] or 0)
-        ms = log_row(ts=min(ts, time.time()), model=r["model"], endpoint="llama-server", inp=r["inp"], out=r["out"], dur=r["dur"],
-                     eval_s=r["eval_s"], status=200, source="llamacpp", dedupe="llamacpp:%d:%d" % (st.st_ino, r["lo"]))
-        fin.append({"model": r["model"], "endpoint": "llama-server", "in": r["inp"], "out": r["out"], "dur": round(r["dur"] or 0, 2), "eval_s": r["eval_s"], "src": "llamacpp", "ms": ms})
-    c = db(); ll_state(c, path, st.st_ino, rows[-1]["end"]); c.commit(); c.close()
+        ms = log_row(ts=r["ts"], model=r["model"], endpoint="llama-server", inp=r["inp"], out=r["out"], dur=r["dur"],
+                     eval_s=r["eval_s"], status=200, source="llamacpp", dedupe=r["dedupe"])
+        n += 1
+        fin.append({"ts": r["ts"], "model": r["model"], "in": r["inp"], "out": r["out"], "dur": round(r["dur"] or 0, 2),
+                    "eval_s": r["eval_s"], "ms": ms})
+    _ll_save(logical, st.st_ino, new_off, gen, st.st_dev, model, data[-32:].hex(), pend)
     if not anchors:
-        with LIVE_LOCK:
-            for x in fin[-20:]: live_bump(); DONE.append((LIVE_VER[0], x))
-            del DONE[:-20]
-    return len(rows)
+        _publish_fresh(fin)
+    LLAMA_BEHIND[0] = new_off < st.st_size
+    if n:
+        print("llama.cpp: logged %d request(s) from %s" % (n, logical), flush=True)
+    return n, model
+
+def llama_scan(path=None, anchors=None, limit=None):
+    """Read new llama-server log lines and record one row per finished request.
+
+    Read only. Missing file, missing directory, or a directory at the path: return 0.
+    limit is the max new bytes this call reads (0 = the whole new region). anchors: optional epoch
+    seconds of each server start, for --llama-backfill; otherwise the file mtime and the log clock are used.
+    """
+    LLAMA_BEHIND[0] = False
+    path = os.path.expanduser(path or LLAMA_LOG or "")
+    if not path:
+        return 0
+    try:
+        st = os.stat(path)
+    except OSError:
+        return 0
+    if not stat.S_ISREG(st.st_mode):
+        return 0
+    state = _ll_load(path)
+    cap = LLAMA_READ_MAX if limit is None else int(limit)
+    if cap < 0:
+        cap = 0
+    n, model = 0, state.get("model")
+    rotated = state["ino"] is not None and (state["ino"] != st.st_ino or (state["dev"] is not None and state["dev"] != st.st_dev))
+    if rotated:
+        found = _rotated_file(path, state["ino"], state["dev"])
+        if found and state["off"] < found[1].st_size:
+            n, model = _llama_consume(path, found[0], found[1], state, cap, anchors)
+            if LLAMA_BEHIND[0]:
+                return n
+        try:
+            st = os.stat(path)
+        except OSError:
+            return n
+        if not stat.S_ISREG(st.st_mode):
+            return n
+        state = {"ino": None, "off": 0, "gen": 0, "dev": None, "model": model, "mark": None, "pend": {}}
+    got, _model = _llama_consume(path, path, st, state, cap, anchors)
+    return n + got
 
 def llama_loop():
     while True:
-        try: llama_scan()
-        except Exception as e: print("llama scan error:", e, file=sys.stderr)
-        time.sleep(LLAMA_POLL_S)
+        try:
+            llama_scan()
+        except Exception as e:
+            print("llama scan error:", e, file=sys.stderr)
+            LLAMA_BEHIND[0] = False
+        time.sleep(0.2 if LLAMA_BEHIND[0] else max(1, LLAMA_POLL_S))
 
 def llama_backfill():
     """One-shot import of everything already in LLAMA_LOG. Optional LLAMA_STARTS: comma-separated epoch
     seconds of each server start in the file, for exact timestamps (else inferred from the file mtime)."""
     anchors = [float(x) for x in os.environ.get("LLAMA_STARTS", "").split(",") if x.strip()] or None
-    print("llama rows logged:", llama_scan(anchors=anchors))
+    n = 0
+    for _ in range(10000):
+        n += llama_scan(anchors=anchors, limit=8000000)   # bounded so a huge log cannot be loaded at once
+        if not LLAMA_BEHIND[0]:
+            break
+    print("llama rows logged:", n)
 
 
 # --- self-update -------------------------------------------------------------------------------
@@ -1431,7 +1755,8 @@ if __name__ == "__main__":
     if "--llama-backfill" in sys.argv:
         llama_backfill(); sys.exit()
     if LLAMA_LOG:
-        threading.Thread(target=llama_loop, daemon=True).start(); print("tailing llama.cpp log", LLAMA_LOG, flush=True)
+        threading.Thread(target=llama_loop, daemon=True).start()
+        print("tailing llama.cpp log", LLAMA_LOG, "(read only; a missing file is fine)", flush=True)
     for spec in filter(None, (x.strip() for x in proxy_specs().split(","))):
         src, _, rest = spec.partition(":"); lp, _, upstream = rest.partition("="); uh, _, upp = upstream.rpartition(":")
         H = type("Proxy_" + src, (Proxy,), {"UPH": uh or "127.0.0.1", "UPP": int(upp), "SRC": src})

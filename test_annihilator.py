@@ -52,23 +52,226 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(ta.add_usage_opt("/v1/chat/completions", b'not json'), b'not json')
 
 
+def _llama_req(task, prompt, out, n_tokens, load=None, prefix="", eval_ms=200.0):
+    lines = []
+    if load:
+        lines.append(load)
+    lines.append("%sslot print_timing: id  0 | task %d | prompt eval time = %10.2f ms / %5d tokens" % (prefix, task, 10.0, prompt))
+    lines.append("%sslot print_timing: id  0 | task %d |        eval time = %10.2f ms / %5d tokens" % (prefix, task, eval_ms, out))
+    lines.append("%sslot print_timing: id  0 | task %d |       total time = %10.2f ms" % (prefix, task, 10.0 + eval_ms))
+    lines.append("%sslot      release: id  0 | task %d | stop processing: n_tokens = %d, truncated = 0" % (prefix, task, n_tokens))
+    return ("\n".join(lines) + "\n").encode()
+
+
 class LlamaLogTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.saved = (ta.DB, tuple(ta.TOT), list(ta.DONE), ta.LIVE_VER[0], ta.LLAMA_READ_MAX,
+                      ta.LLAMA_LOG, ta.OPENAI_PROXIES, ta.ENGINES)
+        ta.DB = os.path.join(self.tmp, "s.db")
+        ta.init_db()
+
+    def tearDown(self):
+        db, tot, done, ver, cap, log, proxies, engines = self.saved
+        ta.DB = db
+        ta.TOT[:] = tot
+        ta.DONE[:] = done
+        ta.LIVE_VER[0] = ver
+        ta.LLAMA_READ_MAX = cap
+        ta.LLAMA_LOG = log
+        ta.OPENAI_PROXIES = proxies
+        ta.ENGINES = engines
+
+    def _rows(self):
+        return sqlite3.connect(ta.DB).execute(
+            "SELECT source, model, input_tokens, output_tokens, eval_s FROM requests ORDER BY id").fetchall()
+
     def test_log_tail_counts_requests(self):
-        tmp = tempfile.mkdtemp(); log = os.path.join(tmp, "server.log")
+        log = os.path.join(self.tmp, "server.log")
+        with open(log, "wb") as f:
+            f.write(_llama_req(7, 12, 30, 42, load="llama_model_loader: load_model: loading model '/models/my-gguf.gguf'"))
+        with open(log, "rb") as f:
+            before = f.read()
+        mtime = os.stat(log).st_mtime_ns
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(ta.llama_scan(log), 0)   # reading it again does not count twice
+        with open(log, "rb") as f:
+            self.assertEqual(f.read(), before)   # the log itself is never written
+        self.assertEqual(os.stat(log).st_mtime_ns, mtime)
+        self.assertEqual(self._rows(), [("llamacpp", "my-gguf", 12, 30, 0.2)])
+
+    def test_missing_log_is_not_an_error_and_is_not_created(self):
+        missing = os.path.join(self.tmp, "no-such-dir", "run", "server.log")
+        self.assertEqual(ta.llama_scan(missing), 0)
+        self.assertFalse(os.path.exists(os.path.dirname(missing)))
+        self.assertEqual(ta.llama_scan(self.tmp), 0)   # a directory, not a file
+        self.assertEqual(self._rows(), [])
+
+    def test_modern_log_uses_prompt_eval_not_context_size(self):
+        # Real llama-server lines: release n_tokens is the slot context (28639), not 467+189.
+        # Colour codes and a harness prefix sit in front. Neither is part of the count.
+        body = "\n".join([
+            "\x1b[32m0.00.018.151 I srv    load_model: loading model '/models/Qwen3.6-27B-Q4_K_M.gguf'\x1b[0m",
+            "Nov  4 03:14:01 spark \x1b[32m1482.46.938.685 I slot print_timing: id  3 | task 232040 | prompt eval time =     897.72 ms /   467 tokens (    1.92 ms per token,   520.21 tokens per second)\x1b[0m",
+            "Nov  4 03:14:01 spark 1482.46.938.692 I slot print_timing: id  3 | task 232040 |        eval time =   24572.14 ms /   189 tokens (  130.01 ms per token,     7.69 tokens per second)",
+            "1482.46.938.693 I slot print_timing: id  3 | task 232040 |       total time =   25469.85 ms /   656 tokens",
+            "1482.46.938.694 I slot print_timing: id  3 | task 232040 |    graphs reused =     224999",
+            "1482.46.940.473 I slot      release: id  3 | task 232040 | stop processing: n_tokens = 28639, truncated = 0",
+        ]) + "\n"
+        log = os.path.join(self.tmp, "server.log")
         with open(log, "w") as f:
-            f.write("llama_model_loader: load_model: loading model '/models/my-gguf.gguf'\n"
-                    "slot print_timing: id  0 | task 7 | prompt eval time =      10.00 ms /    12 tokens\n"
-                    "slot print_timing: id  0 | task 7 |        eval time =     200.00 ms /    30 tokens\n"
-                    "slot print_timing: id  0 | task 7 |       total time =     210.00 ms\n"
-                    "slot      release: id  0 | task 7 | stop processing: n_tokens = 42, truncated = 0\n")
-        old = ta.DB
-        try:
-            ta.DB = os.path.join(tmp, "s.db"); ta.init_db()
-            self.assertEqual(ta.llama_scan(log), 1)
-            self.assertEqual(ta.llama_scan(log), 0)   # no double counting
-            r = sqlite3.connect(ta.DB).execute("SELECT source, model, input_tokens, output_tokens, eval_s FROM requests").fetchall()
-            self.assertEqual(r, [("llamacpp", "my-gguf", 12, 30, 0.2)])
-        finally: ta.DB = old
+            f.write(body)
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(ta.llama_scan(log), 0)
+        source, model, inp, out, eval_s = self._rows()[0]
+        self.assertEqual((source, model, inp, out), ("llamacpp", "Qwen3.6-27B-Q4_K_M", 467, 189))
+        self.assertNotEqual(inp, 28639 - 189)
+        self.assertAlmostEqual(eval_s, 24.57214, places=2)
+        labels = {s["label"]: s["tok"] for s in ta.api_stats()["sources"]}
+        self.assertEqual(labels["llama.cpp"], 467 + 189)
+        board = ta.api_stats()["leaderboard"][0]
+        self.assertEqual(board["model"], "Qwen3.6-27B-Q4_K_M")
+        self.assertIn("llama.cpp", board["src"])
+
+    def test_older_generation_eval_lines_count_too(self):
+        log = os.path.join(self.tmp, "server.log")
+        with open(log, "w") as f:
+            f.write("INFO [print_timings] prompt eval time     =    643.03 ms /     8 tokens | id_task=30\n"
+                    "INFO [print_timings] generation eval time =     784.10 ms /     5 runs | id_task=30\n"
+                    "INFO [print_timings]           total time =    1427.13 ms | id_task=30\n")
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(self._rows()[0][:4], ("llamacpp", "llama.cpp", 8, 5))
+
+    def test_interleaved_tasks_are_both_counted(self):
+        log = os.path.join(self.tmp, "server.log")
+        a = _llama_req(1, 10, 4, 99999).split(b"\n")
+        b = _llama_req(2, 3, 7, 99999).split(b"\n")
+        # task 2's prompt line, then all of task 1, then the rest of task 2. The huge n_tokens must not win.
+        lines = [b[0], a[0], a[1], a[2], a[3], b[1], b[2], b[3]]
+        with open(log, "wb") as f:
+            f.write(b"\n".join(lines) + b"\n")
+        self.assertEqual(ta.llama_scan(log), 2)
+        self.assertEqual(sorted((row[2], row[3]) for row in self._rows()), [(3, 7), (10, 4)])
+
+    def test_partial_line_waits_and_junk_does_not_get_reread(self):
+        log = os.path.join(self.tmp, "server.log")
+        full = _llama_req(4, 6, 8, 14)
+        mark = b"|        eval time"
+        cut = full.index(mark) + len(b"|        ev")   # prompt line is complete; the eval line is cut off
+        with open(log, "wb") as f:
+            f.write(b"warmup noise\n" * 5)
+            f.write(full[:cut])
+        self.assertEqual(ta.llama_scan(log), 0)
+        off = sqlite3.connect(ta.DB).execute("SELECT off FROM llama_state").fetchone()[0]
+        self.assertGreater(off, 0)
+        self.assertLess(off, os.path.getsize(log))
+        with open(log, "ab") as f:
+            f.write(full[cut:])
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(ta.llama_scan(log), 0)
+        self.assertEqual(self._rows(), [("llamacpp", "llama.cpp", 6, 8, 0.2)])
+
+    def test_append_counts_only_the_new_request(self):
+        log = os.path.join(self.tmp, "server.log")
+        with open(log, "wb") as f:
+            f.write(_llama_req(1, 2, 3, 5))
+        self.assertEqual(ta.llama_scan(log), 1)
+        with open(log, "ab") as f:
+            f.write(_llama_req(2, 4, 5, 9))
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(ta.llama_scan(log), 0)
+        self.assertEqual([(r[2], r[3]) for r in self._rows()], [(2, 3), (4, 5)])
+
+    def test_truncation_counts_the_new_contents(self):
+        log = os.path.join(self.tmp, "server.log")
+        with open(log, "wb") as f:
+            f.write(b"header-one\n" + _llama_req(1, 2, 3, 5) + b"padding-so-this-file-is-longer\n")
+        self.assertEqual(ta.llama_scan(log), 1)
+        # Replaced in place, and already longer than the old offset, so size alone is not the signal.
+        with open(log, "wb") as f:
+            f.write(b"header-two-different\n" + _llama_req(9, 8, 1, 9) + b"and some extra lines so the new file is longer than the old one\n" * 3)
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(sorted((r[2], r[3]) for r in self._rows()), [(2, 3), (8, 1)])
+        self.assertEqual(ta.llama_scan(log), 0)
+
+    def test_rename_rotation_keeps_the_unread_tail_and_the_new_file(self):
+        log = os.path.join(self.tmp, "server.log")
+        first, second = _llama_req(1, 2, 3, 5), _llama_req(2, 4, 6, 10)
+        with open(log, "wb") as f:
+            f.write(first + second)
+        ta.LLAMA_READ_MAX = len(first)
+        self.assertEqual(ta.llama_scan(log), 1)
+        os.rename(log, log + ".1")
+        third = _llama_req(3, 7, 8, 15, load="srv load_model: loading model '/m/rotated.gguf'")
+        with open(log, "wb") as f:
+            f.write(third)
+        ta.LLAMA_READ_MAX = 10 ** 7
+        self.assertEqual(ta.llama_scan(log), 2)   # the rest of the renamed file, then the new file
+        self.assertEqual(sorted((r[1], r[2], r[3]) for r in self._rows()),
+                         [("llama.cpp", 2, 3), ("llama.cpp", 4, 6), ("rotated", 7, 8)])
+        self.assertEqual(ta.llama_scan(log), 0)
+
+    def test_old_llama_state_table_still_resumes(self):
+        log = os.path.join(self.tmp, "server.log")
+        body = _llama_req(1, 2, 3, 5, load="load_model: loading model '/m/old.gguf'")
+        with open(log, "wb") as f:
+            f.write(body)
+        st = os.stat(log)
+        c = sqlite3.connect(ta.DB)
+        c.execute("CREATE TABLE llama_state(path TEXT PRIMARY KEY, ino INTEGER, off INTEGER)")
+        c.execute("INSERT INTO llama_state(path, ino, off) VALUES(?,?,?)", (log, st.st_ino, st.st_size))
+        c.commit(); c.close()
+        self.assertEqual(ta.llama_scan(log), 0)   # the stored offset is already at the end
+        with open(log, "ab") as f:
+            f.write(_llama_req(2, 6, 7, 13))
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual([(r[2], r[3]) for r in self._rows()], [(6, 7)])
+
+    def test_old_requests_stay_out_of_the_live_gauge(self):
+        log = os.path.join(self.tmp, "server.log")
+        with open(log, "w") as f:
+            f.write("10.00.000.000 I slot print_timing: id  0 | task 1 | prompt eval time =      10.00 ms /     4 tokens\n"
+                    "10.00.000.100 I slot print_timing: id  0 | task 1 |        eval time =     200.00 ms /     5 tokens\n"
+                    "10.00.000.200 I slot print_timing: id  0 | task 1 |       total time =     210.00 ms /     9 tokens\n")
+        old = time.time() - 3600
+        os.utime(log, (old, old))
+        ta.DONE.clear()
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(ta.DONE, [])
+        self.assertEqual(self._rows()[0][2:4], (4, 5))
+
+    def test_a_request_that_just_finished_is_shown_live(self):
+        log = os.path.join(self.tmp, "server.log")
+        with open(log, "wb") as f:
+            f.write(_llama_req(1, 4, 5, 9))
+        ta.DONE.clear()
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(ta.DONE[-1][1]["src"], "llamacpp")
+        self.assertEqual((ta.DONE[-1][1]["in"], ta.DONE[-1][1]["out"]), (4, 5))
+
+    def test_json_log_lines(self):
+        log = os.path.join(self.tmp, "server.log")
+        def line(msg, task):
+            return json.dumps({"msg": msg, "id_task": task})
+        with open(log, "w") as f:
+            f.write(line("prompt eval time = 10.00 ms / 4 tokens", 3) + "\n")
+            f.write(line("eval time = 200.00 ms / 6 tokens", 3) + "\n")
+            f.write(line("total time = 210.00 ms / 10 tokens", 3) + "\n")
+        self.assertEqual(ta.llama_scan(log), 1)
+        self.assertEqual(self._rows()[0][2:4], (4, 6))
+
+    def test_default_log_path_and_proxy_choice(self):
+        self.assertEqual(ta.DEFAULT_LLAMA_LOG, os.path.expanduser(os.path.join("~", "pixpilot", "run", "server.log")))
+        self.assertEqual(ta.resolve_llama_log(present=False), ta.DEFAULT_LLAMA_LOG)
+        self.assertEqual(ta.resolve_llama_log("", True), "")
+        ta.OPENAI_PROXIES = None
+        ta.ENGINES = ["ollama", "vllm", "llamacpp"]
+        ta.LLAMA_LOG = ""
+        self.assertIn("llamacpp:8081=127.0.0.1:8080", ta.proxy_specs())
+        ta.LLAMA_LOG = ta.DEFAULT_LLAMA_LOG
+        specs = ta.proxy_specs()
+        self.assertIn("vllm:", specs)
+        self.assertNotIn("llamacpp", specs)
 
 
 class MigrationTests(unittest.TestCase):
