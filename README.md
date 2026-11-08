@@ -1,7 +1,7 @@
 # Token Annihilation Dashboard
 
 <p align="center">
-  <img src="logo.png" alt="A little chip breathing out dollar signs" width="180">
+  <img src="static/icon.webp" alt="An angry chip robot inhaling a stream of tokens" width="200">
 </p>
 
 Your local GPU is out there obliterating tokens that a cloud provider would have happily billed you for. This keeps score, with maximum drama.
@@ -24,18 +24,18 @@ Anything that speaks `/v1/chat/completions`, `/v1/completions`, `/v1/responses` 
 
 ## Features
 
-- **Live odometer** of tokens obliterated (all time, never resets), live tokens/sec gauge and "Now annihilating" card over Server-Sent Events (throttled to ~4 updates/s, ~0.2% CPU idle).
-- **Header mascot**: the chip robot at the top left plays a short inhale loop while a request is in flight (including a non-streamed request that is still waiting) and sits on the idle still otherwise. A brief gap between requests does not restart the loop. If the live feed drops, or the browser asks for reduced motion, it stays on the still.
-- **Time filter**: 24 hours (rolling) / 7 days / 30 days / 60 days / 90 days / All time. Filters the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. The odometer and trophies always stay all-time.
+- **Live odometer** of tokens obliterated (all time on the default view, or the window you pick in the time filter), a tokens/sec gauge averaged over the last 60 seconds with a sparkline, and a "Now annihilating" card, all over Server-Sent Events (throttled to ~4 updates/s, ~0.2% CPU idle).
+- **Header mascot**: the angry chip robot at the top left plays a short inhale loop while a request is in flight (including a non-streamed request that is still waiting) and sits on the idle still otherwise. A brief gap between requests does not restart the loop. If the live feed drops, or the browser asks for reduced motion, it stays on the still.
+- **Time filter**: 24 hours (rolling) / 7 days / 30 days / 60 days / 90 days / All time. Filters the odometer, the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. Trophies and milestones always stay all-time.
 - **Model leaderboard** (apex predators) with per-source chips: tokens, requests, average and best tok/s, biggest single output.
 - **Trophy case**: 27 personal records (Speed Demon, Night Owl, Week of Wrath, Iron Streak, Reigning Champion...).
 - **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy: 1M and 10M tokens, every 100M, a much bigger Total Eradication show at every 1B, and every $100 saved. "🎉 test the party" in the footer previews it.
-- **Current killing spree**: tokens, victims (requests), savings and average speed since you last ended a spree. Past sprees rest in "The mass graves". Nothing is ever deleted.
+- **Current killing spree**: tokens, victims (requests), savings and average speed since you last pressed "☠ End this spree" (you can name it). Past sprees rest in "The mass graves". Nothing is ever deleted.
 - **📸 Share card**: previews a 1200x630 PNG of your carnage, then download it, copy it, or use your phone's share sheet (copy and share need https or localhost).
 - **Runtime status chips** next to the time filter: which proxies are up, and a warning when a runtime you have used stops answering.
-- **Odometer that keeps up**: adds a reel whenever the count gains a digit, shrinks the reels to fit the card (phones too), shows a plain-English caption ("≈ 50.8 million tokens"), and on very narrow screens rolls in millions/billions with a unit badge.
+- **Odometer that keeps up**: one reel per digit (added or removed as the count changes), reels shrink to fit the card (phones too), a plain-English caption ("≈ 50.8 million tokens"), and scientific notation (d.ddd × 10^e) from 14 digits up or when the reels would get too small to read.
 - **GitHub-style calendar** of tokens per day for the last year, in NVIDIA green.
-- **Cloud invoices eradicated** vs Claude Opus 5.5, Claude Fable 5.1, GPT-6 Astra, Claude Sonnet 5.5, GPT-6.1 Sol, Gemini 3.1 Pro, GPT-6.1 Terra and Grok 4.7, from `prices.json` (list prices checked 2026-10-28, sources inside; edit freely).
+- **Cloud invoices eradicated** vs Claude Opus 5.5, Claude Fable 5.1, GPT-6 Astra, Claude Sonnet 5.5, GPT-6.1 Sol, Gemini 3.1 Pro, GPT-6.1 Terra and Grok 4.7, from `prices.json` (USD per 1M tokens, list prices checked 2026-10-28, sources inside; edit freely, it is re-read on every page load). The first entry is the headline number and drives the $100 milestones.
 
 ## Install
 
@@ -61,7 +61,7 @@ loginctl enable-linger "$USER"   # keep running after logout
 
 The bottom of the dashboard has an **Update** button and a small hint: **up to date**, **update available**, or **no release found**. Opening the page checks once. Nothing keeps asking GitHub in the background.
 
-**No release found** is normal until the first release is published. The button tells you the installed version and does not change any files.
+**No release found** means GitHub returned no published release (for example on a fork with none). The button then tells you the installed version and does not change any files.
 
 When a newer release exists, the button shows the version you have next to the latest one and asks you to confirm. Only after that does it:
 
@@ -83,7 +83,7 @@ systemctl --user restart token-annihilator
 
 ### Versioning and cutting a release
 
-The version is the `VERSION` file in the repo root: three numbers and nothing else, such as `1.2.0`. This copy ships as `0.0.0`, which means no release has been cut yet. The git tag for a release is `v` plus the same number (`v1.2.0`), and the `VERSION` file on that tag has to say the same thing. The running dashboard reads `VERSION`. It finds the latest release with the public GitHub API, which needs no token. Drafts and pre-releases are ignored, and a tag on its own is not enough: the API only sees a published GitHub Release.
+The version is the `VERSION` file in the repo root: three numbers and nothing else, such as `1.2.0`. The git tag for a release is `v` plus the same number (`v1.2.0`), and the `VERSION` file on that tag has to say the same thing. The running dashboard reads `VERSION`. It finds the latest release with the public GitHub API, which needs no token. Drafts and pre-releases are ignored, and a tag on its own is not enough: the API only sees a published GitHub Release.
 
 ```bash
 # on main: set VERSION to the new number, commit, tag, and push
