@@ -29,6 +29,7 @@ Anything that speaks `/v1/chat/completions`, `/v1/completions`, `/v1/responses` 
 - **Header mascot**: the angry chip robot at the top left plays a short inhale loop while a request is in flight (including a non-streamed request that is still waiting) and sits on the idle still otherwise. A brief gap between requests does not restart the loop. If the live feed drops, or the browser asks for reduced motion, it stays on the still.
 - **Time filter**: 24 hours (rolling) / 7 days / 30 days / 60 days / 90 days / All time. Filters the odometer, the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. Trophies and milestones always stay all-time.
 - **Extinction events survived** (milestone badges): collapsed by default to the most recent few in one row (`MS_PREVIEW`), with a "View all" toggle that expands and collapses the full list.
+- **Settings window** (⚙ button, bottom-right corner): change the milestone tiers, one-off milestones and badge preview count without editing files or env vars. Entries accept K/M/B/T shorthand (`5B`), are validated on the server, apply instantly and are remembered in `stats.db`. "Reset to defaults" forgets the saved settings.
 - **Model leaderboard** (apex predators) with per-source chips: tokens, requests, average and best tok/s, biggest single output.
 - **Trophy case**: 27 personal records (Speed Demon, Night Owl, Week of Wrath, Iron Streak, Reigning Champion...).
 - **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy. They thin out as your totals grow: dollars saved every $100 to $1,000, every $500 to $10,000, then every $10,000; tokens at 1M, 10M, 100M and 500M, then whole billions only (every 1B to 10B, every 5B to 100B, every 50B after that). Opening the page never replays a backlog: at most one celebration, for the most recent milestone you missed, and the rest are marked seen. The schedule is configurable (`MS_*` below). "🎉 test the party" in the footer previews it.
@@ -197,7 +198,9 @@ Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAM
 | `MS_TOK_FIXED` | `1000000,10000000,100000000,500000000` | One-off token milestones below the first tier |
 | `MS_PREVIEW` | `6` | Badges shown in the collapsed "Extinction events survived" row |
 
-Milestones that fall off a changed schedule are hidden, never deleted, and a malformed `MS_*` value is ignored with a warning. The defaults live in one block near the top of `token_annihilator.py`.
+Precedence, per setting: **saved from the Settings window** (gear button), then the `MS_*` env vars above, then the built-in defaults (`MS_DEFAULTS` near the top of `token_annihilator.py`). Reset to defaults in the window clears the saved values, so env vars (if any) apply again. Under the hood: `GET /api/settings` returns the effective, baseline and default settings plus where each came from, and `POST /api/settings` (same-origin only) takes `{"settings": {...}}` or `{"reset": true}`; invalid input is answered with `400` and per-field messages.
+
+Milestones that fall off a changed schedule are hidden, never deleted, and a malformed `MS_*` value is ignored with a warning. When a new schedule includes milestones your totals already passed, they are filed as seen (dated when the total really crossed them), so changing settings never triggers a pop-up flood.
 
 ## Backfill Ollama history (optional)
 

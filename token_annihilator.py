@@ -60,6 +60,7 @@ def init_db():
     c = db()
     c.executescript("""CREATE TABLE IF NOT EXISTS milestones(key TEXT PRIMARY KEY, kind TEXT, value REAL, reached_ts REAL, acked_ts REAL);
       CREATE TABLE IF NOT EXISTS trips(id INTEGER PRIMARY KEY, name TEXT, start_ts REAL, end_ts REAL);
+      CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
       CREATE INDEX IF NOT EXISTS req_ts ON requests(ts); CREATE INDEX IF NOT EXISTS req_src ON requests(source);""")
     # The older multi-engine build logged every proxy as source='proxy' and kept the runtime in a `backend` column,
     # which made vLLM / llama.cpp traffic show up as Ollama. Move those rows to their real source (idempotent).
@@ -70,6 +71,7 @@ def init_db():
         first = c.execute(f"SELECT MIN(ts) FROM requests WHERE {V}").fetchone()[0]
         c.execute("INSERT INTO trips(name,start_ts) VALUES(NULL,?)", (first or time.time(),))
     TOT[0], TOT[1] = c.execute(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0) FROM requests WHERE {V}").fetchone()
+    ms_load_saved(c)
     check_ms(c); c.commit(); c.close()
 
 def hero_price():
@@ -82,7 +84,11 @@ def hero_price():
 def usd(p, i, o): return (i or 0) / 1e6 * p["input_per_mtok"] + (o or 0) / 1e6 * p["output_per_mtok"] if p else 0.0
 
 # ===== Milestone schedule: which totals get a celebration pop-up and a badge ("Extinction events survived") =====
-# Edit the defaults below, or override them with environment variables (a malformed value is ignored with a warning).
+# Where the settings come from, highest priority first (decided per setting):
+#   1. Saved from the dashboard's gear button (Settings window). Stored in the `settings` table of stats.db.
+#   2. Environment variables (below). A malformed value is ignored with a warning.
+#   3. The built-in defaults in MS_DEFAULTS.
+# Saving or resetting in the Settings window applies immediately, with no restart.
 #
 #   *_FIXED  one-off values, e.g. MS_TOK_FIXED="1000000,10000000"
 #   *_TIERS  "upper_bound:step" pairs, comma-separated. Every multiple of `step` above the previous tier's bound,
@@ -94,15 +100,53 @@ def usd(p, i, o): return (i or 0) / 1e6 * p["input_per_mtok"] + (o or 0) / 1e6 *
 # Defaults: dollars saved every $100 to $1,000, every $500 to $10,000, then every $10,000. Tokens 1M, 10M, 100M, 500M,
 # then whole billions only: every 1B to 10B, every 5B to 100B, then every 50B. Changing the schedule never deletes anything:
 # milestones already stored stay in the database, they just stop being shown once they are off the schedule.
+MS_DEFAULTS = {"usd_tiers": [(1_000, 100), (10_000, 500), (None, 10_000)], "usd_fixed": [],
+               "tok_tiers": [(10_000_000_000, 1_000_000_000), (100_000_000_000, 5_000_000_000), (None, 50_000_000_000)],
+               "tok_fixed": [1_000_000, 10_000_000, 100_000_000, 500_000_000], "preview": 6}
+MS_ENV_NAMES = {"usd_tiers": "MS_USD_TIERS", "usd_fixed": "MS_USD_FIXED", "tok_tiers": "MS_TOK_TIERS", "tok_fixed": "MS_TOK_FIXED", "preview": "MS_PREVIEW"}
+MS_MAX_TIERS, MS_MAX_FIXED, MS_MAX_VALUE, MS_MAX_PREVIEW, MS_MAX_COUNT = 12, 40, 10**15, 50, 2000
+
+def _check_tiers(tiers):
+    """[(upper_bound or None, step), ...] -> validated list of tuples. Raises ValueError with a readable reason."""
+    if not isinstance(tiers, (list, tuple)): raise ValueError("tiers must be a list")
+    if len(tiers) > MS_MAX_TIERS: raise ValueError("at most %d tiers" % MS_MAX_TIERS)
+    out, prev = [], 0
+    for n, t in enumerate(tiers):
+        if not isinstance(t, (list, tuple)) or len(t) != 2: raise ValueError("each tier needs an upper limit and a step")
+        hi, step = t
+        if isinstance(step, bool) or not isinstance(step, (int, float)) or step != int(step) or not 0 < step <= MS_MAX_VALUE: raise ValueError("every step must be a whole number above 0")
+        step = int(step)
+        if hi is None:
+            if n != len(tiers) - 1: raise ValueError("only the last tier can have no upper limit")
+        else:
+            if isinstance(hi, bool) or not isinstance(hi, (int, float)) or hi != int(hi) or not 0 < hi <= MS_MAX_VALUE: raise ValueError("every upper limit must be a whole number above 0, or empty for the last tier")
+            hi = int(hi)
+            if hi <= prev: raise ValueError("upper limits must increase from one tier to the next")
+            if hi < step: raise ValueError("a tier's upper limit must be at least its step")
+            prev = hi
+        out.append((hi, step))
+    return out
+
+def _check_fixed(vals):
+    if not isinstance(vals, (list, tuple)): raise ValueError("fixed values must be a list")
+    if len(vals) > MS_MAX_FIXED: raise ValueError("at most %d fixed values" % MS_MAX_FIXED)
+    out = set()
+    for v in vals:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v) or not 0 < v <= MS_MAX_VALUE: raise ValueError("fixed values must be whole numbers above 0")
+        out.add(int(v))
+    return sorted(out)
+
+def _check_preview(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v) or not 1 <= v <= MS_MAX_PREVIEW: raise ValueError("badge preview must be a whole number from 1 to %d" % MS_MAX_PREVIEW)
+    return int(v)
+
+MS_CHECKS = {"usd_tiers": _check_tiers, "tok_tiers": _check_tiers, "usd_fixed": _check_fixed, "tok_fixed": _check_fixed, "preview": _check_preview}
+
 def _env_pairs(name, default):
     raw = os.environ.get(name)
     if raw is None or not raw.strip(): return default
     try:
-        out = [(None if b.strip() == "*" else int(float(b)), int(float(st))) for b, st in (x.split(":") for x in raw.split(",") if x.strip())]
-        bounds = [b for b, _ in out]
-        if not out or any(st <= 0 for _, st in out) or None in bounds[:-1] or any(a >= b for a, b in zip(bounds, bounds[1:]) if b is not None):
-            raise ValueError("steps must be positive, bounds ascending, and '*' last")
-        return out
+        return _check_tiers([(None if b.strip() == "*" else int(float(b)), int(float(st))) for b, st in (x.split(":") for x in raw.split(",") if x.strip())])
     except Exception as e:
         print("ignoring %s=%r (%s); using the default" % (name, raw, e), file=sys.stderr, flush=True); return default
 
@@ -113,12 +157,38 @@ def _env_ints(name, default):
     except Exception as e:
         print("ignoring %s=%r (%s); using the default" % (name, raw, e), file=sys.stderr, flush=True); return default
 
-MS_USD_FIXED = _env_ints("MS_USD_FIXED", [])
-MS_USD_TIERS = _env_pairs("MS_USD_TIERS", [(1_000, 100), (10_000, 500), (None, 10_000)])
-MS_TOK_FIXED = _env_ints("MS_TOK_FIXED", [1_000_000, 10_000_000, 100_000_000, 500_000_000])
-MS_TOK_TIERS = _env_pairs("MS_TOK_TIERS", [(10_000_000_000, 1_000_000_000), (100_000_000_000, 5_000_000_000), (None, 50_000_000_000)])
-MS_PREVIEW = max(1, (_env_ints("MS_PREVIEW", [6]) or [6])[0])
-MS_CFG = {"usd": {"fixed": MS_USD_FIXED, "tiers": MS_USD_TIERS}, "tok": {"fixed": MS_TOK_FIXED, "tiers": MS_TOK_TIERS}, "preview": MS_PREVIEW}
+def ms_env_settings():
+    """Only the settings that the environment actually provides (valid ones)."""
+    out = {}
+    for k, name in MS_ENV_NAMES.items():
+        if name not in os.environ or (not os.environ[name].strip() and not k.endswith("_fixed")): continue   # an empty *_FIXED means "none"
+        try:
+            if k.endswith("_tiers"): v = _env_pairs(name, None)
+            elif k == "preview": v = _check_preview(float(os.environ[name]))
+            else: v = _check_fixed(_env_ints(name, None) or [])
+        except Exception as e:
+            print("ignoring %s=%r (%s); using the default" % (name, os.environ[name], e), file=sys.stderr, flush=True); continue
+        if v is not None: out[k] = v
+    return out
+
+MS_ENV = ms_env_settings()
+MS_SAVED = {}   # settings saved from the dashboard (loaded from stats.db by init_db)
+
+def ms_baseline():
+    """What 'reset to defaults' returns to: the environment where set, else the built-in default."""
+    return {k: MS_ENV.get(k, MS_DEFAULTS[k]) for k in MS_DEFAULTS}
+
+def ms_effective():
+    return {k: MS_SAVED.get(k, v) for k, v in ms_baseline().items()}
+
+def ms_apply():
+    """Make the effective settings the live ones (no restart needed)."""
+    global MS_USD_FIXED, MS_USD_TIERS, MS_TOK_FIXED, MS_TOK_TIERS, MS_PREVIEW, MS_CFG
+    e = ms_effective()
+    MS_USD_FIXED, MS_USD_TIERS, MS_TOK_FIXED, MS_TOK_TIERS, MS_PREVIEW = e["usd_fixed"], e["usd_tiers"], e["tok_fixed"], e["tok_tiers"], e["preview"]
+    MS_CFG = {"usd": {"fixed": MS_USD_FIXED, "tiers": MS_USD_TIERS}, "tok": {"fixed": MS_TOK_FIXED, "tiers": MS_TOK_TIERS}, "preview": MS_PREVIEW}
+
+ms_apply()
 
 def ms_values(fixed, tiers, upto):
     """Every scheduled milestone value <= upto, ascending."""
@@ -126,7 +196,9 @@ def ms_values(fixed, tiers, upto):
     prev = 0
     for hi, step in tiers:
         v = (prev // step + 1) * step
-        while v <= upto and (hi is None or v <= hi): out.add(v); v += step
+        while v <= upto and (hi is None or v <= hi):
+            out.add(v); v += step
+            if len(out) > 200_000: raise ValueError("too many milestones: use a bigger step")
         if hi is None or upto <= hi: break
         prev = hi
     return sorted(out)
@@ -136,11 +208,87 @@ def ms_reached(tok, dollars):
 
 def check_ms(c):
     new = []
-    for kind, v in ms_reached(TOT[0] + TOT[1], usd(hero_price(), TOT[0], TOT[1])):
+    try: reached = ms_reached(TOT[0] + TOT[1], usd(hero_price(), TOT[0], TOT[1]))
+    except ValueError as e:   # a silly schedule must never stop requests being logged
+        print("milestone schedule error:", e, file=sys.stderr, flush=True); return new
+    for kind, v in reached:
         key = "%s:%d" % (kind, v)
         if c.execute("INSERT OR IGNORE INTO milestones(key,kind,value,reached_ts) VALUES(?,?,?,?)", (key, kind, v, time.time())).rowcount:
             new.append({"key": key, "kind": kind, "value": v})
     return new
+
+def ms_load_saved(c):
+    """Load the dashboard-saved settings (settings table) into MS_SAVED, dropping anything that no longer validates."""
+    MS_SAVED.clear()
+    row = c.execute("SELECT value FROM settings WHERE key='milestones'").fetchone()
+    if not row: return
+    try: saved = json.loads(row[0])
+    except Exception: saved = {}
+    for k, chk in MS_CHECKS.items():
+        if isinstance(saved, dict) and k in saved:
+            try: MS_SAVED[k] = chk(saved[k])
+            except ValueError as e: print("ignoring saved setting %s: %s" % (k, e), file=sys.stderr, flush=True)
+    ms_apply()
+
+def ms_backfill_seen(c):
+    """After a schedule change, record milestones that are on the new schedule and were already passed. They are marked seen
+    (no pop-up), dated when the totals really crossed them."""
+    price = hero_price()
+    top_t, top_u = TOT[0] + TOT[1], usd(price, TOT[0], TOT[1])
+    want = {"tok": [v for v in ms_values(MS_TOK_FIXED, MS_TOK_TIERS, top_t)], "usd": [v for v in ms_values(MS_USD_FIXED, MS_USD_TIERS, top_u)]}
+    have = {r[0] for r in c.execute("SELECT key FROM milestones")}
+    need = {k: [v for v in vs if "%s:%d" % (k, v) not in have] for k, vs in want.items()}
+    if not need["tok"] and not need["usd"]: return 0
+    ti_t = ti_u = 0; cum_t = 0; cum_u = 0.0; n = 0
+    pend = {k: sorted(v) for k, v in need.items()}; found = {}
+    for ts, i, o in c.execute(f"SELECT ts,COALESCE(input_tokens,0),COALESCE(output_tokens,0) FROM requests WHERE {V} ORDER BY ts"):
+        cum_t += i + o; cum_u += usd(price, i, o)
+        while ti_t < len(pend["tok"]) and cum_t >= pend["tok"][ti_t]: found["tok:%d" % pend["tok"][ti_t]] = ts; ti_t += 1
+        while ti_u < len(pend["usd"]) and cum_u >= pend["usd"][ti_u]: found["usd:%d" % pend["usd"][ti_u]] = ts; ti_u += 1
+        if ti_t >= len(pend["tok"]) and ti_u >= len(pend["usd"]): break
+    now = time.time()
+    for k, vs in need.items():
+        for v in vs:
+            key = "%s:%d" % (k, v)
+            n += c.execute("INSERT OR IGNORE INTO milestones(key,kind,value,reached_ts,acked_ts) VALUES(?,?,?,?,?)", (key, k, v, found.get(key, now), now)).rowcount
+    return n
+
+def settings_payload():
+    base = ms_baseline(); eff = ms_effective()
+    src = {k: "ui" if k in MS_SAVED else "env" if k in MS_ENV else "default" for k in MS_DEFAULTS}
+    return {"ok": True, "settings": eff, "baseline": base, "defaults": MS_DEFAULTS, "sources": src, "env": {k: MS_ENV_NAMES[k] for k in MS_ENV}}
+
+def settings_save(body):
+    """POST /api/settings: {"settings": {...}} saves (and applies) the given settings, {"reset": true} clears the saved ones.
+    Returns (http_status, payload)."""
+    if body.get("reset") is True:
+        new = {}
+    else:
+        incoming = body.get("settings")
+        if not isinstance(incoming, dict) or not incoming: return 400, {"ok": False, "errors": {"settings": "send {\"settings\": {...}} or {\"reset\": true}"}}
+        errors, new = {}, {}
+        for k, v in incoming.items():
+            if k not in MS_CHECKS: errors[k] = "unknown setting"; continue
+            try: new[k] = MS_CHECKS[k](v)
+            except ValueError as e: errors[k] = str(e)
+        if errors: return 400, {"ok": False, "errors": errors}
+        # a schedule with thousands of milestones is almost certainly a typo (an extra zero too few)
+        trial = {**ms_effective(), **new}
+        for kind, tiers, fixed, top in (("tok", trial["tok_tiers"], trial["tok_fixed"], TOT[0] + TOT[1]), ("usd", trial["usd_tiers"], trial["usd_fixed"], usd(hero_price(), TOT[0], TOT[1]))):
+            try: n = len(ms_values(fixed, tiers, top))
+            except ValueError: n = MS_MAX_COUNT + 1
+            if n > MS_MAX_COUNT: errors[kind + "_tiers"] = "that would make more than %d milestones at your current totals; use bigger steps" % MS_MAX_COUNT
+        if errors: return 400, {"ok": False, "errors": errors}
+    with lock:
+        c = db()
+        try:
+            merged = {} if body.get("reset") is True else {**MS_SAVED, **new}
+            if merged: c.execute("INSERT INTO settings(key,value) VALUES('milestones',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps({k: merged[k] for k in merged}),))
+            else: c.execute("DELETE FROM settings WHERE key='milestones'")
+            MS_SAVED.clear(); MS_SAVED.update(merged); ms_apply()
+            ms_backfill_seen(c); c.commit()
+        finally: c.close()
+    return 200, settings_payload()
 
 def log_row(**r):
     try:
@@ -550,6 +698,7 @@ class Dash(http.server.BaseHTTPRequestHandler):
             try: days = int(qs.get("days", 0))
             except ValueError: days = 0
             return self.json(api_stats(time.time() - days * 86400 if days > 0 else None))
+        if p == "/api/settings": return self.json(settings_payload())
         if p == "/api/update":
             try: return self.json(update_status())
             except Exception as e:
@@ -580,13 +729,16 @@ class Dash(http.server.BaseHTTPRequestHandler):
         except Exception: pass
     def do_POST(self):
         p = self.path.split("?")[0]
-        n = min(int(self.headers.get("Content-Length") or 0), 8192)
+        n = min(int(self.headers.get("Content-Length") or 0), 16384)
         try: body = json.loads(self.rfile.read(n) or b"{}")
         except Exception: body = {}
         if not isinstance(body, dict): body = {}
         try:
             if p == "/api/trip/reset": trip_reset(body.get("name")); return self.json(api_stats())
             if p == "/api/milestones/ack": ms_ack(body.get("keys")); return self.json({"ok": True})
+            if p == "/api/settings":
+                if not origin_ok(self.headers): return self.json({"ok": False, "errors": {"settings": "Settings can only be changed from the dashboard page."}}, 403)
+                code, res = settings_save(body); return self.json(res, code)
             if p == "/api/update":
                 code, res = begin_update(body, self.headers)
                 self.json(res, code)
@@ -683,6 +835,11 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 .fbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap}.fbar .muted{margin-top:14px}
 .msvid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.45;pointer-events:none}.msshade{position:absolute;inset:0;background:radial-gradient(circle at 50% 50%,rgba(0,0,0,.25),rgba(0,0,0,.85));pointer-events:none}
 .tiny{background:none;border:none;color:#3f4757;font-size:11px;cursor:pointer}
+.gear{position:fixed;right:18px;bottom:18px;z-index:20;width:46px;height:46px;border-radius:50%;padding:0;font-size:22px;line-height:1;box-shadow:0 4px 18px rgba(0,0,0,.55)}body{padding-bottom:78px}
+#setDlg{width:min(94vw,720px);max-width:none;max-height:90vh;overflow:auto}#setDlg input{width:96px;margin:0 6px;padding:6px 8px;border-radius:8px;border:1px solid #2f4a10;background:#0b0d10;color:#e6e6e6;font-size:14px}#setDlg input[aria-invalid=true]{border-color:#c04040;background:#1d0d0d}
+.sg{border:1px solid #232833;border-radius:12px;margin:12px 0;padding:8px 14px 12px}.sg legend{color:var(--g);font-weight:700;padding:0 6px}.sr{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin:6px 0}.sh{color:#6b7285;font-size:12px}
+.btn.xs{padding:3px 9px;font-size:12px}.sx{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px}.sc{display:inline-flex;align-items:center;border:1px solid #2f4a10;background:#101a08;border-radius:999px;padding:2px 4px 2px 10px;color:#c8f27a}#setDlg .sc input{width:84px;border:none;background:transparent;margin:0 2px;padding:3px}.sxb{background:none;border:none;color:#9aa3b5;cursor:pointer;font-size:12px}
+#setDlg .dacts{position:sticky;bottom:-18px;background:#14171d;padding:10px 0 2px}.serr{color:#ffb3b3;min-height:18px;font-size:13px;margin-top:8px}.sok{color:#9fd14a}
 .btn:disabled{opacity:.55;cursor:wait}.upd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:6px 0 12px}
 .hint-ok{color:#9fd14a;font-size:12px}.hint-new{color:var(--g);font-weight:700;font-size:12px}
 #updDlg{max-width:480px}#updBody{white-space:pre-wrap;line-height:1.45}
@@ -722,6 +879,8 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 <p class=muted>No GPUs were harmed. Entire bloodlines of cloud invoices were. <button class=tiny id=msTest title="Preview the 1 billion celebration (does not count)">🎉 test the party</button></p>
 <div class=upd><button class=btn id=updBtn title="Check the official GitHub releases and install a newer one">Update</button><span class=muted id=updHint>checking for updates…</span></div>
 <dialog id=updDlg><form method=dialog><b style="color:var(--g)" id=updTitle>Dashboard update</b><div id=updBody style="margin-top:8px"></div><div class=dacts style="margin-top:14px"><button class=btn value=cancel>Close</button><button class=btn id=updGo value=ok hidden>Install</button></div></form></dialog>
+<button class="btn gear" id=setBtn title="Settings: milestones and badges" aria-label="Settings">⚙</button>
+<dialog id=setDlg aria-labelledby=setTitle><b style="color:var(--g);font-size:16px" id=setTitle>Settings</b><div class=muted style="margin-top:4px">Milestones: when the dashboard throws a party and earns a badge. Changes apply right away and are remembered (saved settings win over <code>MS_*</code> environment variables, which win over the built-in defaults). Use K, M, B and T for thousands, millions, billions and trillions, like <b>5B</b>.</div><div id=setBody></div><div class=serr id=setErr role=status></div><div class=dacts style="margin-top:10px;justify-content:space-between"><button type=button class="btn red" id=setReset title="Forget saved settings and go back to the defaults">Reset to defaults</button><span style="display:flex;gap:10px"><button type=button class=btn id=setCancel>Cancel</button><button type=button class=btn id=setSave>Save</button></span></div></dialog>
 <div id=tip></div>
 <script>
 const D=__DATA__;
@@ -834,6 +993,40 @@ function confetti(n,ms){if(RM)return;const cv=$('conf'),x=cv.getContext('2d');cv
   if(alive)requestAnimationFrame(f)})(performance.now())}
 $('msX').onclick=e=>{e.stopPropagation();nextMs()};$('ms').onclick=nextMs;addEventListener('keydown',e=>{if(showing&&(e.key=='Escape'||e.key=='Enter'))nextMs()});
 $('msTest').onclick=()=>celebrate({kind:'tok',value:1e9,test:true});
+// ===== settings window (milestones + badge preview); the server validates and applies changes live
+const SG=[['usd','Dollars saved','$'],['tok','Tokens','']];let SF=null;
+const pnum=t=>{t=String(t).trim().toLowerCase().replace(/[$,\s_]/g,'');const m=t.match(/^(\d*\.?\d+)([kmbt]?)$/);if(!m)return NaN;const v=+m[1]*({'':1,k:1e3,m:1e6,b:1e9,t:1e12}[m[2]]),r=Math.round(v);return Math.abs(v-r)<=1e-6*Math.max(1,v)?r:NaN};
+const snum=v=>v>=1e12&&v%1e12==0?v/1e12+'T':v>=1e9&&v%1e9==0?v/1e9+'B':v>=1e6&&v%1e6==0?v/1e6+'M':v>=1e3&&v%1e3==0?v/1e3+'K':String(v);
+function sFrom(s){const f={preview:String(s.preview)};for(const [g] of SG){const t=s[g+'_tiers'],last=t.length?t[t.length-1]:null;f[g]={tiers:t.filter(x=>x[0]!=null).map(x=>[snum(x[0]),snum(x[1])]),open:last&&last[0]==null?snum(last[1]):'',fixed:s[g+'_fixed'].map(snum)}}return f}
+function sRender(){$('setBody').innerHTML=SG.map(([g,name,pre])=>`<fieldset class=sg><legend>${name}</legend><div class=sh>Tiers: a milestone every <b>step</b>, up to a <b>limit</b>, then the next tier takes over.</div>`
+ +SF[g].tiers.map((t,i)=>`<div class=sr>Up to ${pre}<input data-g=${g} data-k=t data-i=${i} data-c=0 value="${esc(t[0])}" aria-label="${name}, tier ${i+1}, up to"> every ${pre}<input data-g=${g} data-k=t data-i=${i} data-c=1 value="${esc(t[1])}" aria-label="${name}, tier ${i+1}, every"><button type=button class="btn xs" data-act=dt data-g=${g} data-i=${i} title="Remove this tier" aria-label="Remove tier ${i+1}">✕</button></div>`).join('')
+ +`<div class=sr>After that (no upper limit), every ${pre}<input data-g=${g} data-k=o value="${esc(SF[g].open)}" placeholder="never" aria-label="${name}, after the last tier, every"></div><button type=button class="btn xs" data-act=at data-g=${g}>+ Add tier</button>`
+ +`<div class=sh style="margin-top:12px">Extra one-off milestones</div><div class=sx>`+SF[g].fixed.map((v,i)=>`<span class=sc>${pre}<input data-g=${g} data-k=f data-i=${i} value="${esc(v)}" aria-label="${name}, one-off value ${i+1}"><button type=button class=sxb data-act=df data-g=${g} data-i=${i} aria-label="Remove one-off value ${i+1}">✕</button></span>`).join('')+`<button type=button class="btn xs" data-act=af data-g=${g}>+ Add value</button></div></fieldset>`).join('')
+ +`<fieldset class=sg><legend>Badges</legend><div class=sr>Show the latest <input data-k=p value="${esc(SF.preview)}" style="width:60px" aria-label="Badges shown when collapsed"> badges when "Extinction events survived" is collapsed</div></fieldset>`;sCheck()}
+function sBuild(){const out={},bad=new Set();let err='';const fail=(m,el)=>{if(!err)err=m;if(el)bad.add(el)};
+ for(const [g,name] of SG){const tiers=[];let prev=0;
+  SF[g].tiers.forEach((t,i)=>{if(!t[0].trim()&&!t[1].trim())return;const lim=pnum(t[0]),st=pnum(t[1]);
+   if(!(lim>0))fail(name+': tier '+(i+1)+' needs a whole-number limit above 0',[g,'t',i,0]);else if(!(st>0))fail(name+': tier '+(i+1)+' needs a whole-number step above 0',[g,'t',i,1]);
+   else if(lim<st)fail(name+': tier '+(i+1)+' limit must be at least its step',[g,'t',i,0]);else if(lim<=prev)fail(name+': limits must go up from tier to tier',[g,'t',i,0]);else{tiers.push([lim,st]);prev=lim}});
+  if(SF[g].open.trim()){const st=pnum(SF[g].open);if(!(st>0))fail(name+': the step after the last tier must be a whole number above 0',[g,'o']);else tiers.push([null,st])}
+  const fx=[];SF[g].fixed.forEach((v,i)=>{if(!v.trim())return;const n=pnum(v);if(!(n>0))fail(name+': one-off values must be whole numbers above 0',[g,'f',i]);else fx.push(n)});
+  out[g+'_tiers']=tiers;out[g+'_fixed']=[...new Set(fx)].sort((a,b)=>a-b)}
+ const pv=Number(SF.preview);if(!Number.isInteger(pv)||pv<1||pv>50)fail('Badge preview must be a whole number from 1 to 50',['p']);out.preview=pv;return{out,err,bad}}
+function sCheck(){if(!SF)return;const {err,bad}=sBuild();$('setErr').className='serr';$('setErr').textContent=err;$('setSave').disabled=!!err;
+ $('setBody').querySelectorAll('input').forEach(el=>{const d=el.dataset,k=d.k=='t'?[d.g,'t',+d.i,+d.c]:d.k=='o'?[d.g,'o']:d.k=='f'?[d.g,'f',+d.i]:['p'];el.setAttribute('aria-invalid',[...bad].some(b=>b.join()==k.join()))})}
+function sLoad(r){SF=sFrom(r.settings);sRender()}
+async function sGet(){const r=await fetch('api/settings',{cache:'no-store'});if(!r.ok)throw 0;return r.json()}
+async function sPost(b){const r=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j={};try{j=await r.json()}catch(_){}return{ok:r.ok&&j.ok,j}}
+$('setBtn').onclick=async()=>{try{sLoad(await sGet());$('setDlg').showModal()}catch(_){alert('Could not load the settings.')}};
+$('setCancel').onclick=()=>$('setDlg').close();
+$('setBody').addEventListener('input',e=>{const d=e.target.dataset,v=e.target.value;if(!d.k||!SF)return;if(d.k=='t')SF[d.g].tiers[+d.i][+d.c]=v;else if(d.k=='o')SF[d.g].open=v;else if(d.k=='f')SF[d.g].fixed[+d.i]=v;else if(d.k=='p')SF.preview=v;sCheck()});
+$('setBody').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;const d=b.dataset,g=d.g;
+ if(d.act=='dt')SF[g].tiers.splice(+d.i,1);else if(d.act=='df')SF[g].fixed.splice(+d.i,1);else if(d.act=='at')SF[g].tiers.push(['','']);else if(d.act=='af')SF[g].fixed.push('');
+ sRender();if(d.act=='at'||d.act=='af'){const l=[...$('setBody').querySelectorAll(`input[data-g=${g}][data-k=${d.act=='at'?'t':'f'}]`)];const el=d.act=='at'?l[l.length-2]:l[l.length-1];if(el)el.focus()}});
+$('setSave').onclick=async()=>{const {out,err}=sBuild();if(err)return;$('setSave').disabled=true;
+ try{const {ok,j}=await sPost({settings:out});if(ok){$('setDlg').close();await refreshNow()}else{$('setErr').className='serr';$('setErr').textContent=Object.values(j.errors||{}).join(' ')||'The dashboard refused those settings.'}}catch(_){$('setErr').textContent='Could not save. Is the dashboard still running?'}$('setSave').disabled=false};
+$('setReset').onclick=async()=>{try{const {ok,j}=await sPost({reset:true});if(ok){sLoad(j);await refreshNow();$('setErr').className='serr sok';$('setErr').textContent='Back to the defaults. Saved settings cleared.'}}catch(_){$('setErr').textContent='Could not reset.'}};
+
 // milestones reached while nobody was watching: never replay a backlog. At most ONE party, for the most recent one crossed
 // (on the current schedule), and every unseen milestone is marked seen either way
 {const p=ST.milestones.filter(m=>!m.acked),s=p.filter(m=>m.sched!==false);if(p.length){const keys=p.map(m=>m.key);
