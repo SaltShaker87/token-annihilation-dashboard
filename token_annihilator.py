@@ -662,7 +662,7 @@ table{width:100%;border-collapse:collapse;font-size:14px}td{padding:6px 8px;bord
 .btn{background:#13200a;color:#c8f27a;border:1px solid #3f7a00;border-radius:10px;padding:7px 13px;font:600 13px system-ui,sans-serif;cursor:pointer}.btn:hover{background:#1d3310;border-color:var(--g)}.btn.red{background:#2a0d0d;color:#ffb3b3;border-color:#7a2020}
 .acts{display:flex;gap:10px;align-items:center}
 .r3{grid-template-columns:1fr 2fr}
-.chips{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 10px}.chip{font-size:12px;border:1px solid #2f4a10;background:#101a08;color:#c8f27a;border-radius:999px;padding:3px 10px}.chip.soon{border-style:dashed;color:#6b7285;border-color:#2a2f3a;background:none}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 10px}.chips.one{flex-wrap:nowrap;overflow:hidden}.chips.open{max-height:220px;overflow-y:auto}.msh .tiny{margin-left:10px;text-transform:none;letter-spacing:0;vertical-align:middle;font:600 12px system-ui,sans-serif;color:#c8f27a;background:#13200a;border:1px solid #3f7a00;border-radius:999px;padding:3px 12px;cursor:pointer}.msh .tiny:hover{background:#1d3310;border-color:var(--g)}.chips .chip{white-space:nowrap}.chip{font-size:12px;border:1px solid #2f4a10;background:#101a08;color:#c8f27a;border-radius:999px;padding:3px 10px}.chip.soon{border-style:dashed;color:#6b7285;border-color:#2a2f3a;background:none}
 .rk{font-size:18px;width:34px;text-align:center}.lbm{font-weight:600}.lbs{font-size:11px;color:#6b7285}
 .recs{display:grid;grid-template-columns:repeat(auto-fill,minmax(205px,1fr));gap:12px}
 .rec{background:linear-gradient(160deg,#16210c,#14171d 55%);border:1px solid #2f4a10;border-radius:14px;padding:12px;transition:transform .2s}.rec:hover{transform:translateY(-2px) rotate(-.4deg);box-shadow:0 0 18px rgba(118,185,0,.18)}
@@ -714,7 +714,7 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
  <div class=card><h2>Model leaderboard: apex predators <span id=lbRng style="text-transform:none;letter-spacing:0;color:#9fd14a"></span></h2><div class=chips id=srcs></div><div class=scroll><table id=modT></table></div></div>
 </div>
 <h3>Trophy case: hall of total eradication (all time) <span id=recN style="color:#9fd14a;text-transform:none;letter-spacing:0"></span></h3><div class=recs id=recs></div>
-<h3>Extinction events survived</h3><div class=chips id=msList></div>
+<h3 class=msh>Extinction events survived <button class=tiny id=msToggle aria-expanded=false aria-controls=msList hidden>View all</button></h3><div class="chips one" id=msList></div>
 <div><h3>Daily obliteration ledger <span id=logRng style="text-transform:none;letter-spacing:0;color:#9fd14a"></span></h3><div class=scroll id=ledger><table id=daysT></table></div></div>
 <dialog id=tripDlg><form method=dialog><b style="color:var(--g)">End this killing spree?</b><div class=muted style="margin-top:6px">The current spree gets buried in the mass graves and a fresh one begins. All-time totals stay untouched.</div><input id=tripName maxlength=60 placeholder="Name this spree (optional), e.g. Fine-tune round 2"><div style="display:flex;gap:10px;justify-content:flex-end"><button class=btn value=cancel>Never mind</button><button class="btn red" value=ok>Bury it</button></div></form></dialog>
 <dialog id=shareDlg><b style="color:var(--g)">Your carnage, ready to share</b><img id=shareImg alt="Share card: tokens obliterated, cloud invoices eradicated and trophies"><div class=dacts><button class=btn id=shareNative hidden>📤 Share</button><button class=btn id=shareCopy hidden>📋 Copy image</button><button class=btn id=shareDl>⬇ Download PNG</button><button class=btn id=shareX>Close</button></div><div class=muted id=shareMsg style="margin-top:8px;text-align:right"></div></dialog>
@@ -798,7 +798,12 @@ function renderRt(){$('rts').innerHTML=(ST.runtimes||[]).filter(r=>r.ok||r.used&
   :`<span class="chip${r.ok?'':' down'}" title="clients use :${r.listen}, forwarded to ${esc(r.up)}">${r.ok?'●':'○'} ${esc(r.label)} :${r.listen}${r.ok?'':' (nobody home)'}</span>`).join('')}
 const bigNum=v=>v>=1e9?+(v/1e9).toFixed(1)+' BILLION':v>=1e6?+(v/1e6).toFixed(1)+' MILLION':fmt(v);
 function msName(m){return m.kind=='usd'?'$'+fmt(m.value)+' saved':bigNum(m.value).toLowerCase()+' tokens'}
-function renderMs(){$('msList').innerHTML=ST.milestones.map(m=>`<span class=chip title="${esc(when(m.reached_ts))}">${m.kind=='usd'?'💰':m.value>=1e9?'🌋':'🎉'} ${esc(msName(m))}</span>`).join('')||'<span class="chip soon">None yet. First stop: 1 million tokens. Then $100 saved.</span>'}
+let msOpen=false;
+function renderMs(){const all=ST.milestones.filter(m=>m.sched!==false).sort((a,b)=>b.reached_ts-a.reached_ts||b.value-a.value),n=(ST.ms_cfg&&ST.ms_cfg.preview)||6,list=msOpen?all:all.slice(0,n),t=$('msToggle');
+ $('msList').className='chips '+(msOpen?'open':'one');
+ $('msList').innerHTML=list.map(m=>`<span class=chip title="${esc(when(m.reached_ts))}">${m.kind=='usd'?'💰':m.value>=1e9?'🌋':'🎉'} ${esc(msName(m))}</span>`).join('')||'<span class="chip soon">None yet. First stop: 1 million tokens. Then $100 saved.</span>';
+ t.hidden=all.length<=n;t.textContent=msOpen?'Collapse':`View all (${all.length})`;t.setAttribute('aria-expanded',msOpen)}
+$('msToggle').onclick=()=>{msOpen=!msOpen;renderMs()}
 function msNext(c,cur){let best=Infinity,prev=0;for(const v of c.fixed)if(v>cur&&v<best)best=v;for(const [hi,st] of c.tiers){const v=(Math.floor(Math.max(cur,prev)/st)+1)*st;if(hi==null||v<=hi){if(v<best)best=v;break}prev=hi}return best}
 function nextMilestone(){const tok=tin+tout,sv=hero?cost(hero,tin,tout):0,C=ST.ms_cfg;const nt=msNext(C.tok,tok),ns=msNext(C.usd,sv);
  $('nextMs').textContent=`Next party: ${bigNum(nt).toLowerCase()} tokens (${fmt(nt-tok)} to go)`+(hero?` · $${fmt(ns)} saved ($${(ns-sv).toFixed(2)} to go)`:'')}

@@ -395,6 +395,7 @@ class ProxyTests(unittest.TestCase):
         st, page = req(self.dash, "GET", "/"); self.assertEqual(st, 200); text = page.decode()
         self.assertIn('src="static/icon.webp"', text); self.assertIn("static/splash.mp4", text)
         self.assertIn("esc(x.model)", text)   # model names are HTML-escaped client-side; embedded JSON escapes "</"
+        self.assertIn("id=msToggle", text); self.assertIn('class="chips one" id=msList', text)   # badges start collapsed
         self.assertIn("id=updBtn", text); self.assertIn(">Update</button>", text)
         self.assertIn('"version": "%s"' % ta.read_version(), text); self.assertIn('"boot":', text)
         st, img = req(self.dash, "GET", "/static/icon-32.png"); self.assertTrue(img.startswith(b"\x89PNG"))
