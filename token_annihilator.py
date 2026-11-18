@@ -779,7 +779,7 @@ class Dash(http.server.BaseHTTPRequestHandler):
         finally:
             CLIENTS[0] -= 1
 
-PAGE = r"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>DGX Token Annihilator Dashboard</title><link rel=icon type=image/png sizes=32x32 href="static/icon-32.png"><link rel=apple-touch-icon sizes=180x180 href="static/icon-180.png"><link rel=preload as=image href="static/mascot-inhale.webp"><style>
+PAGE = r"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><title>DGX Token Annihilator Dashboard</title><link rel=icon type=image/png sizes=32x32 href="static/icon-32.png"><link rel=apple-touch-icon sizes=180x180 href="static/icon-180.png"><link rel=preload as=image href="static/mascot-inhale.webp"><style>
 :root{--g:#76B900}
 *{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0b0d10;color:#e6e6e6;margin:0;padding:20px 28px;max-width:1240px;margin:auto}
 h1{font-weight:800;margin:0;color:var(--g);letter-spacing:.02em}.brand{display:flex;align-items:center;gap:14px}.brand .mascot{width:80px;height:80px;flex:none;border-radius:14px;overflow:hidden;background:#0b0d10;line-height:0}.brand .mascot img{width:80px;height:80px;display:block;object-fit:cover;background:#0b0d10}.top{display:flex;justify-content:space-between;align-items:center}
@@ -836,10 +836,17 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 .msvid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.45;pointer-events:none}.msshade{position:absolute;inset:0;background:radial-gradient(circle at 50% 50%,rgba(0,0,0,.25),rgba(0,0,0,.85));pointer-events:none}
 .tiny{background:none;border:none;color:#3f4757;font-size:11px;cursor:pointer}
 .gear{position:fixed;right:18px;bottom:18px;z-index:20;width:46px;height:46px;border-radius:50%;padding:0;font-size:22px;line-height:1;box-shadow:0 4px 18px rgba(0,0,0,.55)}body{padding-bottom:78px}
-#setDlg{width:min(94vw,720px);max-width:none;max-height:90vh;overflow:auto}#setDlg input{width:96px;margin:0 6px;padding:6px 8px;border-radius:8px;border:1px solid #2f4a10;background:#0b0d10;color:#e6e6e6;font-size:14px}#setDlg input[aria-invalid=true]{border-color:#c04040;background:#1d0d0d}
+#setDlg{--sh:100vh;width:min(94vw,720px);max-width:none;padding:0;overflow:hidden;max-height:calc(var(--sh) - 24px);flex-direction:column}@supports (height:100dvh){#setDlg{--sh:100dvh}}
+#setDlg[open]{display:flex}.sth{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px 10px;border-bottom:1px solid #232833;flex:none}.sth b{color:var(--g);font-size:16px}
+.stb{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:8px 16px}.stf{flex:none;border-top:1px solid #232833;background:#14171d;padding:10px 16px calc(12px + env(safe-area-inset-bottom))}
+.stf .dacts{justify-content:space-between;flex-wrap:wrap}.stf .dacts>span{display:flex;gap:10px}html.setlock,html.setlock body{overflow:hidden}
+#setDlg input{width:96px;margin:0 6px;padding:6px 8px;border-radius:8px;border:1px solid #2f4a10;background:#0b0d10;color:#e6e6e6;font-size:16px}#setDlg input[aria-invalid=true]{border-color:#c04040;background:#1d0d0d}
+#setDlg .sg{min-width:0}#setDlg .sr input{flex:1 1 70px;min-width:0;width:auto;margin:0 2px}#setDlg .sr.t{flex-wrap:nowrap;white-space:nowrap}#setDlg .sr.t .btn{flex:none;margin-left:2px}#setDlg .sr.o input{flex:0 1 110px}
+@media (max-width:600px){#setDlg{width:100vw;max-width:100vw;height:var(--sh);max-height:var(--sh);margin:0;top:0;left:0;border-radius:0;border-width:0}.sth{padding-top:calc(12px + env(safe-area-inset-top));padding-left:calc(14px + env(safe-area-inset-left));padding-right:calc(14px + env(safe-area-inset-right))}
+.stb{padding:6px calc(12px + env(safe-area-inset-left)) 6px calc(12px + env(safe-area-inset-right))}.stf{padding-left:calc(12px + env(safe-area-inset-left));padding-right:calc(12px + env(safe-area-inset-right))}.sg{padding:6px 10px 10px}}
 .sg{border:1px solid #232833;border-radius:12px;margin:12px 0;padding:8px 14px 12px}.sg legend{color:var(--g);font-weight:700;padding:0 6px}.sr{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin:6px 0}.sh{color:#6b7285;font-size:12px}
 .btn.xs{padding:3px 9px;font-size:12px}.sx{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px}.sc{display:inline-flex;align-items:center;border:1px solid #2f4a10;background:#101a08;border-radius:999px;padding:2px 4px 2px 10px;color:#c8f27a}#setDlg .sc input{width:84px;border:none;background:transparent;margin:0 2px;padding:3px}.sxb{background:none;border:none;color:#9aa3b5;cursor:pointer;font-size:12px}
-#setDlg .dacts{position:sticky;bottom:-18px;background:#14171d;padding:10px 0 2px}.serr{color:#ffb3b3;min-height:18px;font-size:13px;margin-top:8px}.sok{color:#9fd14a}
+#setDlg .dacts{margin:0}.serr{color:#ffb3b3;font-size:13px;margin:0 0 8px}.serr:empty{display:none}.sok{color:#9fd14a}
 .btn:disabled{opacity:.55;cursor:wait}.upd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:6px 0 12px}
 .hint-ok{color:#9fd14a;font-size:12px}.hint-new{color:var(--g);font-weight:700;font-size:12px}
 #updDlg{max-width:480px}#updBody{white-space:pre-wrap;line-height:1.45}
@@ -880,7 +887,7 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 <div class=upd><button class=btn id=updBtn title="Check the official GitHub releases and install a newer one">Update</button><span class=muted id=updHint>checking for updates…</span></div>
 <dialog id=updDlg><form method=dialog><b style="color:var(--g)" id=updTitle>Dashboard update</b><div id=updBody style="margin-top:8px"></div><div class=dacts style="margin-top:14px"><button class=btn value=cancel>Close</button><button class=btn id=updGo value=ok hidden>Install</button></div></form></dialog>
 <button class="btn gear" id=setBtn title="Settings: milestones and badges" aria-label="Settings">⚙</button>
-<dialog id=setDlg aria-labelledby=setTitle><b style="color:var(--g);font-size:16px" id=setTitle>Settings</b><div class=muted style="margin-top:4px">Milestones: when the dashboard throws a party and earns a badge. Changes apply right away and are remembered (saved settings win over <code>MS_*</code> environment variables, which win over the built-in defaults). Use K, M, B and T for thousands, millions, billions and trillions, like <b>5B</b>.</div><div id=setBody></div><div class=serr id=setErr role=status></div><div class=dacts style="margin-top:10px;justify-content:space-between"><button type=button class="btn red" id=setReset title="Forget saved settings and go back to the defaults">Reset to defaults</button><span style="display:flex;gap:10px"><button type=button class=btn id=setCancel>Cancel</button><button type=button class=btn id=setSave>Save</button></span></div></dialog>
+<dialog id=setDlg aria-labelledby=setTitle><div class=sth><b id=setTitle>Settings</b><button type=button class="btn xs" id=setX aria-label="Close settings">✕</button></div><div class=stb id=setScroll><div class=muted style="margin:4px 0 6px">Milestones: when the dashboard throws a party and earns a badge. Changes apply right away and are remembered (saved settings win over <code>MS_*</code> environment variables, which win over the built-in defaults). Use K, M, B and T for thousands, millions, billions and trillions, like <b>5B</b>.</div><div id=setBody></div></div><div class=stf><div class=serr id=setErr role=status></div><div class=dacts><button type=button class="btn red" id=setReset title="Forget saved settings and go back to the defaults">Reset to defaults</button><span><button type=button class=btn id=setCancel>Cancel</button><button type=button class=btn id=setSave>Save</button></span></div></div></dialog>
 <div id=tip></div>
 <script>
 const D=__DATA__;
@@ -999,8 +1006,8 @@ const pnum=t=>{t=String(t).trim().toLowerCase().replace(/[$,\s_]/g,'');const m=t
 const snum=v=>v>=1e12&&v%1e12==0?v/1e12+'T':v>=1e9&&v%1e9==0?v/1e9+'B':v>=1e6&&v%1e6==0?v/1e6+'M':v>=1e3&&v%1e3==0?v/1e3+'K':String(v);
 function sFrom(s){const f={preview:String(s.preview)};for(const [g] of SG){const t=s[g+'_tiers'],last=t.length?t[t.length-1]:null;f[g]={tiers:t.filter(x=>x[0]!=null).map(x=>[snum(x[0]),snum(x[1])]),open:last&&last[0]==null?snum(last[1]):'',fixed:s[g+'_fixed'].map(snum)}}return f}
 function sRender(){$('setBody').innerHTML=SG.map(([g,name,pre])=>`<fieldset class=sg><legend>${name}</legend><div class=sh>Tiers: a milestone every <b>step</b>, up to a <b>limit</b>, then the next tier takes over.</div>`
- +SF[g].tiers.map((t,i)=>`<div class=sr>Up to ${pre}<input data-g=${g} data-k=t data-i=${i} data-c=0 value="${esc(t[0])}" aria-label="${name}, tier ${i+1}, up to"> every ${pre}<input data-g=${g} data-k=t data-i=${i} data-c=1 value="${esc(t[1])}" aria-label="${name}, tier ${i+1}, every"><button type=button class="btn xs" data-act=dt data-g=${g} data-i=${i} title="Remove this tier" aria-label="Remove tier ${i+1}">✕</button></div>`).join('')
- +`<div class=sr>After that (no upper limit), every ${pre}<input data-g=${g} data-k=o value="${esc(SF[g].open)}" placeholder="never" aria-label="${name}, after the last tier, every"></div><button type=button class="btn xs" data-act=at data-g=${g}>+ Add tier</button>`
+ +SF[g].tiers.map((t,i)=>`<div class='sr t'>Up to ${pre}<input data-g=${g} data-k=t data-i=${i} data-c=0 value="${esc(t[0])}" aria-label="${name}, tier ${i+1}, up to"> every ${pre}<input data-g=${g} data-k=t data-i=${i} data-c=1 value="${esc(t[1])}" aria-label="${name}, tier ${i+1}, every"><button type=button class="btn xs" data-act=dt data-g=${g} data-i=${i} title="Remove this tier" aria-label="Remove tier ${i+1}">✕</button></div>`).join('')
+ +`<div class='sr o'>After that (no upper limit), every ${pre}<input data-g=${g} data-k=o value="${esc(SF[g].open)}" placeholder="never" aria-label="${name}, after the last tier, every"></div><button type=button class="btn xs" data-act=at data-g=${g}>+ Add tier</button>`
  +`<div class=sh style="margin-top:12px">Extra one-off milestones</div><div class=sx>`+SF[g].fixed.map((v,i)=>`<span class=sc>${pre}<input data-g=${g} data-k=f data-i=${i} value="${esc(v)}" aria-label="${name}, one-off value ${i+1}"><button type=button class=sxb data-act=df data-g=${g} data-i=${i} aria-label="Remove one-off value ${i+1}">✕</button></span>`).join('')+`<button type=button class="btn xs" data-act=af data-g=${g}>+ Add value</button></div></fieldset>`).join('')
  +`<fieldset class=sg><legend>Badges</legend><div class=sr>Show the latest <input data-k=p value="${esc(SF.preview)}" style="width:60px" aria-label="Badges shown when collapsed"> badges when "Extinction events survived" is collapsed</div></fieldset>`;sCheck()}
 function sBuild(){const out={},bad=new Set();let err='';const fail=(m,el)=>{if(!err)err=m;if(el)bad.add(el)};
@@ -1017,8 +1024,16 @@ function sCheck(){if(!SF)return;const {err,bad}=sBuild();$('setErr').className='
 function sLoad(r){SF=sFrom(r.settings);sRender()}
 async function sGet(){const r=await fetch('api/settings',{cache:'no-store'});if(!r.ok)throw 0;return r.json()}
 async function sPost(b){const r=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j={};try{j=await r.json()}catch(_){}return{ok:r.ok&&j.ok,j}}
-$('setBtn').onclick=async()=>{try{sLoad(await sGet());$('setDlg').showModal()}catch(_){alert('Could not load the settings.')}};
-$('setCancel').onclick=()=>$('setDlg').close();
+// keep the window inside the *visible* viewport (mobile browser toolbars show and hide) and freeze the page behind it
+let sY=0,sLocked=false;
+function sFit(){const v=window.visualViewport;$('setDlg').style.setProperty('--sh',Math.round(v?v.height:innerHeight)+'px')}
+function sLock(){if(sLocked)return;sLocked=true;sY=scrollY;const b=document.body.style;b.position='fixed';b.top=-sY+'px';b.left=b.right='0';b.width='100%';document.documentElement.classList.add('setlock');sFit();
+ addEventListener('resize',sFit);if(window.visualViewport){visualViewport.addEventListener('resize',sFit);visualViewport.addEventListener('scroll',sFit)}}
+function sUnlock(){if(!sLocked)return;sLocked=false;const b=document.body.style;b.position=b.top=b.left=b.right=b.width='';document.documentElement.classList.remove('setlock');
+ removeEventListener('resize',sFit);if(window.visualViewport){visualViewport.removeEventListener('resize',sFit);visualViewport.removeEventListener('scroll',sFit)}scrollTo(0,sY)}
+$('setDlg').addEventListener('close',sUnlock);
+$('setBtn').onclick=async()=>{try{sLoad(await sGet());sLock();$('setDlg').showModal();$('setScroll').scrollTop=0}catch(_){sUnlock();alert('Could not load the settings.')}};
+$('setCancel').onclick=()=>$('setDlg').close();$('setX').onclick=()=>$('setDlg').close();
 $('setBody').addEventListener('input',e=>{const d=e.target.dataset,v=e.target.value;if(!d.k||!SF)return;if(d.k=='t')SF[d.g].tiers[+d.i][+d.c]=v;else if(d.k=='o')SF[d.g].open=v;else if(d.k=='f')SF[d.g].fixed[+d.i]=v;else if(d.k=='p')SF.preview=v;sCheck()});
 $('setBody').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;const d=b.dataset,g=d.g;
  if(d.act=='dt')SF[g].tiers.splice(+d.i,1);else if(d.act=='df')SF[g].fixed.splice(+d.i,1);else if(d.act=='at')SF[g].tiers.push(['','']);else if(d.act=='af')SF[g].fixed.push('');
