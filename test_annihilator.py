@@ -395,6 +395,7 @@ class ProxyTests(unittest.TestCase):
         st, page = req(self.dash, "GET", "/"); self.assertEqual(st, 200); text = page.decode()
         self.assertIn('src="static/icon.webp"', text); self.assertIn("static/splash.mp4", text)
         self.assertIn("esc(x.model)", text)   # model names are HTML-escaped client-side; embedded JSON escapes "</"
+        self.assertIn("id=msToggle", text); self.assertIn('class="chips one" id=msList', text)   # badges start collapsed
         self.assertIn("id=updBtn", text); self.assertIn(">Update</button>", text)
         self.assertIn('"version": "%s"' % ta.read_version(), text); self.assertIn('"boot":', text)
         st, img = req(self.dash, "GET", "/static/icon-32.png"); self.assertTrue(img.startswith(b"\x89PNG"))
@@ -1300,6 +1301,49 @@ class RestartEndToEndTests(unittest.TestCase):
                 except Exception: pass
             rel.shutdown(); rel.server_close()
             subprocess.run(["rm", "-rf", root], check=False)
+
+
+class TensorFoldTests(unittest.TestCase):
+    def test_probe_recognises_tensorfold_not_as_vllm(self):
+        s = Server(("127.0.0.1", 19190), Handler); s.queue = {}; s.seen = []
+        s.gets = {"/v1/models": '{"object":"list","data":[{"id":"qwen","owned_by":"tensorfold"}]}'}
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        try: self.assertEqual(ta.probe("127.0.0.1", 19190), "tensorfold")
+        finally: s.shutdown(); s.server_close()
+
+    def test_vllm_proxy_relabels_to_whichever_backend_answers(self):
+        saved = list(ta.RUNTIMES); H = type("Proxy_t", (ta.Proxy,), {"SRC": "vllm"}); real = ta.probe
+        try:
+            ta.RUNTIMES[:] = [{"src": "vllm", "listen": 1, "up": ("127.0.0.1", 1), "cls": H, "started": True}]
+            ta.probe = lambda h, p: "tensorfold"; ta.check_runtimes(); self.assertEqual((ta.RUNTIMES[0]["src"], H.SRC), ("tensorfold", "tensorfold"))
+            ta.probe = lambda h, p: "vllm"; ta.check_runtimes(); self.assertEqual((ta.RUNTIMES[0]["src"], H.SRC), ("vllm", "vllm"))
+            ta.probe = lambda h, p: "llamacpp"; ta.check_runtimes(); self.assertEqual(H.SRC, "vllm")   # never relabelled to an unrelated engine
+        finally: ta.probe = real; ta.RUNTIMES[:] = saved
+        self.assertEqual(ta.SOURCE_LABELS["tensorfold"], "TensorFold")
+
+
+class MilestoneScheduleTests(unittest.TestCase):
+    def test_default_schedule(self):
+        usd = ta.ms_values(ta.MS_USD_FIXED, ta.MS_USD_TIERS, 25000)
+        self.assertEqual(usd, list(range(100, 1001, 100)) + list(range(1500, 10001, 500)) + [20000])
+        tok = ta.ms_values(ta.MS_TOK_FIXED, ta.MS_TOK_TIERS, 12_200_000_000)
+        self.assertEqual(tok, [10**6, 10**7, 10**8, 5 * 10**8] + [i * 10**9 for i in range(1, 11)])
+        self.assertTrue(all(v % 10**9 == 0 for v in tok if v >= 10**9))   # past 1 billion: whole billions only
+        self.assertEqual(ta.ms_values([], [(None, 7)], 30), [7, 14, 21, 28])
+        self.assertEqual(ta.ms_reached(0, 0), [])
+
+    def test_env_overrides_and_bad_values(self):
+        saved = dict(os.environ)
+        try:
+            os.environ["MS_USD_TIERS"] = "500:250,*:1000"
+            self.assertEqual(ta._env_pairs("MS_USD_TIERS", "dflt"), [(500, 250), (None, 1000)])
+            self.assertEqual(ta.ms_values([], [(500, 250), (None, 1000)], 3000), [250, 500, 1000, 2000, 3000])
+            for bad in ("abc", "100:0", "*:5,100:10", "200:5,100:10", "100"):
+                os.environ["MS_USD_TIERS"] = bad
+                self.assertEqual(ta._env_pairs("MS_USD_TIERS", "dflt"), "dflt", bad)
+            os.environ["MS_TOK_FIXED"] = "5, 10"; self.assertEqual(ta._env_ints("MS_TOK_FIXED", []), [5, 10])
+            os.environ["MS_TOK_FIXED"] = "x"; self.assertEqual(ta._env_ints("MS_TOK_FIXED", [1]), [1])
+        finally: os.environ.clear(); os.environ.update(saved)
 
 
 if __name__ == "__main__":

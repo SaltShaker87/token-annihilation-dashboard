@@ -14,6 +14,7 @@ Backends supported, each with its own source label:
 |---|---|---|
 | **Ollama** | Transparent proxy (default `:11435` -> `:11434`) | Ollama |
 | **vLLM** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | vLLM |
+| **TensorFold** (MiaAI-Lab's Zig engine, OpenAI-compatible) | Same counting proxy as vLLM. Detected from `owned_by: tensorfold` in `/v1/models` or a `Server: TensorFold` header | TensorFold |
 | **llama.cpp** (`llama-server`) | Read-only read of llama-server's log. Default file: `~/pixpilot/run/server.log`. The 8081 proxy is optional and stays off while a log path is set | llama.cpp |
 | **NVIDIA NIM / NeMo, TensorRT-LLM, Triton (OpenAI front end), SGLang, LM Studio** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | NVIDIA NIM, NeMo, TensorRT-LLM, ... |
 | **ONNX Runtime** (Foundry Local, onnxruntime-genai OpenAI servers) | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | ONNX Runtime |
@@ -27,9 +28,10 @@ Anything that speaks `/v1/chat/completions`, `/v1/completions`, `/v1/responses` 
 - **Live odometer** of tokens obliterated (all time on the default view, or the window you pick in the time filter), a tokens/sec gauge averaged over the last 60 seconds with a sparkline, and a "Now annihilating" card, all over Server-Sent Events (throttled to ~4 updates/s, ~0.2% CPU idle).
 - **Header mascot**: the angry chip robot at the top left plays a short inhale loop while a request is in flight (including a non-streamed request that is still waiting) and sits on the idle still otherwise. A brief gap between requests does not restart the loop. If the live feed drops, or the browser asks for reduced motion, it stays on the still.
 - **Time filter**: 24 hours (rolling) / 7 days / 30 days / 60 days / 90 days / All time. Filters the odometer, the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. Trophies and milestones always stay all-time.
+- **Extinction events survived** (milestone badges): collapsed by default to the most recent few in one row (`MS_PREVIEW`), with a "View all" toggle that expands and collapses the full list.
 - **Model leaderboard** (apex predators) with per-source chips: tokens, requests, average and best tok/s, biggest single output.
 - **Trophy case**: 27 personal records (Speed Demon, Night Owl, Week of Wrath, Iron Streak, Reigning Champion...).
-- **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy: 1M and 10M tokens, every 100M, a much bigger Total Eradication show at every 1B, and every $100 saved. "🎉 test the party" in the footer previews it.
+- **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy. They thin out as your totals grow: dollars saved every $100 to $1,000, every $500 to $10,000, then every $10,000; tokens at 1M, 10M, 100M and 500M, then whole billions only (every 1B to 10B, every 5B to 100B, every 50B after that). Opening the page never replays a backlog: at most one celebration, for the most recent milestone you missed, and the rest are marked seen. The schedule is configurable (`MS_*` below). "🎉 test the party" in the footer previews it.
 - **Current killing spree**: tokens, victims (requests), savings and average speed since you last pressed "☠ End this spree" (you can name it). Past sprees rest in "The mass graves". Nothing is ever deleted.
 - **📸 Share card**: previews a 1200x630 PNG of your carnage, then download it, copy it, or use your phone's share sheet (copy and share need https or localhost).
 - **Runtime status chips** next to the time filter: which proxies are up, and a warning when a runtime you have used stops answering.
@@ -120,6 +122,8 @@ Automatic: as soon as vLLM answers on port 8000, a counting proxy opens on **800
 OPENAI_PROXIES="vllm:8001=spark-1:8000" python3 token_annihilator.py
 ```
 
+Swapping vLLM and TensorFold on the same port is fine: the proxy is relabelled to whichever one answers (re-checked every 30 s), so each new request is logged under the right name. Old rows keep the label they were logged with. Other engines are never relabelled.
+
 The proxy reads the `usage` field from every response. For streaming requests it automatically adds `"stream_options": {"include_usage": true}` (only when the client did not set `stream_options` itself) so the final chunk carries the token counts. Disable that with `INJECT_USAGE=0`. vLLM reports no timings, so for streamed requests the speed (tok/s) is measured from the first to the last streamed chunk.
 
 ### llama.cpp
@@ -187,6 +191,13 @@ Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAM
 | `LLAMA_MODEL` | `llama.cpp` | Model name until the log says which GGUF was loaded |
 | `LLAMA_STARTS` | empty | Optional comma-separated epoch start times for exact `--llama-backfill` timestamps |
 | `STATS_DB` | `./stats.db` | SQLite file |
+| `MS_USD_TIERS` | `1000:100,10000:500,*:10000` | Dollar-saved milestones as `upper_bound:step` pairs: every `step` up to `upper_bound`, then the next pair. `*` means no upper bound and goes last |
+| `MS_USD_FIXED` | empty | Extra one-off dollar milestones, comma-separated |
+| `MS_TOK_TIERS` | `10000000000:1000000000,100000000000:5000000000,*:50000000000` | Token milestones in the same format (every 1B to 10B, every 5B to 100B, then every 50B) |
+| `MS_TOK_FIXED` | `1000000,10000000,100000000,500000000` | One-off token milestones below the first tier |
+| `MS_PREVIEW` | `6` | Badges shown in the collapsed "Extinction events survived" row |
+
+Milestones that fall off a changed schedule are hidden, never deleted, and a malformed `MS_*` value is ignored with a warning. The defaults live in one block near the top of `token_annihilator.py`.
 
 ## Backfill Ollama history (optional)
 
