@@ -395,6 +395,7 @@ class ProxyTests(unittest.TestCase):
         st, page = req(self.dash, "GET", "/"); self.assertEqual(st, 200); text = page.decode()
         self.assertIn('src="static/icon.webp"', text); self.assertIn("static/splash.mp4", text)
         self.assertIn("esc(x.model)", text)   # model names are HTML-escaped client-side; embedded JSON escapes "</"
+        self.assertIn("id=setBtn", text); self.assertIn("id=setDlg", text)   # settings gear + window
         self.assertIn("id=msToggle", text); self.assertIn('class="chips one" id=msList', text)   # badges start collapsed
         self.assertIn("id=updBtn", text); self.assertIn(">Update</button>", text)
         self.assertIn('"version": "%s"' % ta.read_version(), text); self.assertIn('"boot":', text)
@@ -1344,6 +1345,112 @@ class MilestoneScheduleTests(unittest.TestCase):
             os.environ["MS_TOK_FIXED"] = "5, 10"; self.assertEqual(ta._env_ints("MS_TOK_FIXED", []), [5, 10])
             os.environ["MS_TOK_FIXED"] = "x"; self.assertEqual(ta._env_ints("MS_TOK_FIXED", [1]), [1])
         finally: os.environ.clear(); os.environ.update(saved)
+
+
+class SettingsApiTests(unittest.TestCase):
+    """The Settings window's API: validation, persistence in stats.db, live apply, and UI > env > default precedence."""
+    PORT = 18195
+
+    def start(self, **env):
+        e = dict(os.environ, STATS_DB=self.db, DASH_BIND="127.0.0.1", DASH_PORT=str(self.PORT), PROXY_BIND="127.0.0.1", OLLAMA_PROXY="0", OPENAI_PROXIES="", LLAMA_LOG="")
+        for k in [k for k in e if k.startswith("MS_")]: del e[k]
+        e.update(env)
+        self.proc = subprocess.Popen([sys.executable, os.path.join(HERE, "token_annihilator.py")], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.procs.append(self.proc)
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                if req(self.PORT, "GET", "/api/settings")[0] == 200: return
+            except Exception: time.sleep(0.1)
+        self.fail("dashboard did not start")
+
+    def stop(self):
+        self.proc.terminate()
+        try: self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired: self.proc.kill()
+        self.proc.stdout.close()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="annihilator-settings-"); self.db = os.path.join(self.tmp, "stats.db"); self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            if p.poll() is None: self.stop_proc(p)
+
+    def stop_proc(self, p):
+        p.terminate()
+        try: p.wait(timeout=3)
+        except subprocess.TimeoutExpired: p.kill()
+        p.stdout.close()
+
+    def get(self): return json.loads(req(self.PORT, "GET", "/api/settings")[1])
+
+    def post(self, payload, origin=True):
+        c = http.client.HTTPConnection("127.0.0.1", self.PORT, timeout=5)
+        h = {"Content-Type": "application/json"}
+        if origin: h["Origin"] = "http://127.0.0.1:%d" % self.PORT
+        c.request("POST", "/api/settings", body=json.dumps(payload), headers=h); r = c.getresponse(); d = json.loads(r.read()); c.close(); return r.status, d
+
+    def test_defaults_and_get(self):
+        self.start()
+        j = self.get(); s = j["settings"]
+        self.assertEqual(s["preview"], 6); self.assertEqual(s["usd_tiers"], [[1000, 100], [10000, 500], [None, 10000]])
+        self.assertEqual(s["tok_fixed"], [10**6, 10**7, 10**8, 5 * 10**8]); self.assertEqual(set(j["sources"].values()), {"default"})
+        self.assertEqual(json.loads(req(self.PORT, "GET", "/api/stats")[1])["ms_cfg"]["preview"], 6)
+        self.stop()
+
+    def test_save_applies_live_persists_and_resets(self):
+        self.start()
+        new = {"usd_tiers": [[1000, 250], [None, 5000]], "usd_fixed": [750, 750], "tok_tiers": [[None, 2 * 10**9]], "tok_fixed": [], "preview": 9}
+        st, j = self.post({"settings": new}); self.assertEqual(st, 200, j)
+        self.assertEqual(j["settings"]["usd_tiers"], [[1000, 250], [None, 5000]]); self.assertEqual(j["settings"]["usd_fixed"], [750]); self.assertEqual(set(j["sources"].values()), {"ui"})
+        live = json.loads(req(self.PORT, "GET", "/api/stats")[1])["ms_cfg"]   # live, no restart
+        self.assertEqual((live["preview"], live["tok"]["tiers"], live["usd"]["fixed"]), (9, [[None, 2 * 10**9]], [750]))
+        self.stop(); self.start()   # persisted in stats.db
+        self.assertEqual(self.get()["settings"]["preview"], 9)
+        self.assertEqual(sqlite3.connect(self.db).execute("SELECT COUNT(*) FROM settings WHERE key='milestones'").fetchone()[0], 1)
+        st, j = self.post({"reset": True}); self.assertEqual(st, 200); self.assertEqual(j["settings"]["preview"], 6); self.assertEqual(set(j["sources"].values()), {"default"})
+        self.assertEqual(sqlite3.connect(self.db).execute("SELECT COUNT(*) FROM settings").fetchone()[0], 0)
+        self.stop()
+
+    def test_precedence_ui_then_env_then_default(self):
+        self.start(MS_PREVIEW="3", MS_USD_TIERS="500:50,*:500")
+        j = self.get(); self.assertEqual(j["settings"]["preview"], 3); self.assertEqual(j["settings"]["usd_tiers"], [[500, 50], [None, 500]])
+        self.assertEqual((j["sources"]["preview"], j["sources"]["usd_tiers"], j["sources"]["tok_tiers"]), ("env", "env", "default"))
+        st, j = self.post({"settings": {"preview": 12}}); self.assertEqual(st, 200)   # one setting saved: only that one moves to ui
+        self.assertEqual((j["settings"]["preview"], j["sources"]["preview"], j["sources"]["usd_tiers"]), (12, "ui", "env"))
+        self.stop(); self.start(MS_PREVIEW="3", MS_USD_TIERS="500:50,*:500")
+        self.assertEqual(self.get()["settings"]["preview"], 12)   # saved beats env after a restart too
+        st, j = self.post({"reset": True}); self.assertEqual(j["settings"]["preview"], 3)   # reset returns to env, not to the built-in default
+        self.stop()
+
+    def test_validation_and_origin_check(self):
+        self.start()
+        before = self.get()["settings"]
+        bad = [{"preview": 0}, {"preview": 51}, {"preview": 2.5}, {"usd_tiers": [[100, 0]]}, {"usd_tiers": [[None, 5], [100, 5]]}, {"usd_tiers": [[100, 10], [50, 10]]},
+               {"usd_tiers": [[10, 100]]}, {"tok_fixed": [-1]}, {"tok_fixed": ["x"]}, {"usd_tiers": "nope"}, {"nonsense": 1}, {"usd_tiers": [[1, 1]] * 13}]
+        for b in bad:
+            st, j = self.post({"settings": b}); self.assertEqual(st, 400, b); self.assertFalse(j["ok"]); self.assertTrue(j["errors"], b)
+        self.assertEqual(self.post({"settings": {"preview": 4}}, origin=False)[0], 403)   # not from the dashboard page
+        self.assertEqual(self.post({})[0], 400)
+        self.assertEqual(self.get()["settings"], before)   # nothing half-applied
+        self.stop()
+
+    def test_changing_the_schedule_does_not_replay_old_milestones(self):
+        self.start(); self.stop()   # create the schema
+        c = sqlite3.connect(self.db); now = time.time()
+        for i in range(10): c.execute("INSERT INTO requests(ts,model,endpoint,input_tokens,output_tokens,status,source) VALUES(?,?,?,?,?,?,?)", (now - 1000 + i, "m", "/v1/chat", 10**9, 0, 200, "vllm"))
+        c.commit(); c.close()
+        self.start()
+        st, j = self.post({"settings": {"tok_tiers": [[None, 2_500_000_000]], "tok_fixed": []}}); self.assertEqual(st, 200)
+        rows = {k: (r, a) for k, r, a in sqlite3.connect(self.db).execute("SELECT key,reached_ts,acked_ts FROM milestones WHERE kind='tok'")}
+        for k in ("tok:2500000000", "tok:7500000000"):   # new on this schedule, already passed: recorded as seen, so no pop-up
+            self.assertIn(k, rows); self.assertIsNotNone(rows[k][1])
+        self.assertLess(rows["tok:2500000000"][0], now - 996)   # dated when the total really crossed it, not "now"
+        self.assertEqual(self.post({"settings": {"tok_tiers": [[None, 1]]}})[0], 400)   # millions of milestones: refused, not hung
+        sched = {m["key"]: m["sched"] for m in json.loads(req(self.PORT, "GET", "/api/stats")[1])["milestones"]}
+        self.assertTrue(sched["tok:5000000000"]); self.assertFalse(sched["tok:3000000000"])
+        self.stop()
 
 
 if __name__ == "__main__":
