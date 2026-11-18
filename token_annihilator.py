@@ -81,13 +81,58 @@ def hero_price():
 
 def usd(p, i, o): return (i or 0) / 1e6 * p["input_per_mtok"] + (o or 0) / 1e6 * p["output_per_mtok"] if p else 0.0
 
+# ===== Milestone schedule: which totals get a celebration pop-up and a badge ("Extinction events survived") =====
+# Edit the defaults below, or override them with environment variables (a malformed value is ignored with a warning).
+#
+#   *_FIXED  one-off values, e.g. MS_TOK_FIXED="1000000,10000000"
+#   *_TIERS  "upper_bound:step" pairs, comma-separated. Every multiple of `step` above the previous tier's bound,
+#            up to `upper_bound` ("*" = no upper bound, so it must come last), is a milestone.
+#            MS_USD_TIERS="1000:100,10000:500,*:10000" means $100, $200 ... $1,000, then $1,500, $2,000 ... $10,000,
+#            then $20,000, $30,000 ...
+#   MS_PREVIEW  how many of the most recent badges show while the badge section is collapsed.
+#
+# Defaults: dollars saved every $100 to $1,000, every $500 to $10,000, then every $10,000. Tokens 1M, 10M, 100M, 500M,
+# then whole billions only: every 1B to 10B, every 5B to 100B, then every 50B. Changing the schedule never deletes anything:
+# milestones already stored stay in the database, they just stop being shown once they are off the schedule.
+def _env_pairs(name, default):
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip(): return default
+    try:
+        out = [(None if b.strip() == "*" else int(float(b)), int(float(st))) for b, st in (x.split(":") for x in raw.split(",") if x.strip())]
+        bounds = [b for b, _ in out]
+        if not out or any(st <= 0 for _, st in out) or None in bounds[:-1] or any(a >= b for a, b in zip(bounds, bounds[1:]) if b is not None):
+            raise ValueError("steps must be positive, bounds ascending, and '*' last")
+        return out
+    except Exception as e:
+        print("ignoring %s=%r (%s); using the default" % (name, raw, e), file=sys.stderr, flush=True); return default
+
+def _env_ints(name, default):
+    raw = os.environ.get(name)
+    if raw is None: return default
+    try: return [int(float(x)) for x in raw.split(",") if x.strip()]
+    except Exception as e:
+        print("ignoring %s=%r (%s); using the default" % (name, raw, e), file=sys.stderr, flush=True); return default
+
+MS_USD_FIXED = _env_ints("MS_USD_FIXED", [])
+MS_USD_TIERS = _env_pairs("MS_USD_TIERS", [(1_000, 100), (10_000, 500), (None, 10_000)])
+MS_TOK_FIXED = _env_ints("MS_TOK_FIXED", [1_000_000, 10_000_000, 100_000_000, 500_000_000])
+MS_TOK_TIERS = _env_pairs("MS_TOK_TIERS", [(10_000_000_000, 1_000_000_000), (100_000_000_000, 5_000_000_000), (None, 50_000_000_000)])
+MS_PREVIEW = max(1, (_env_ints("MS_PREVIEW", [6]) or [6])[0])
+MS_CFG = {"usd": {"fixed": MS_USD_FIXED, "tiers": MS_USD_TIERS}, "tok": {"fixed": MS_TOK_FIXED, "tiers": MS_TOK_TIERS}, "preview": MS_PREVIEW}
+
+def ms_values(fixed, tiers, upto):
+    """Every scheduled milestone value <= upto, ascending."""
+    out = {int(v) for v in fixed if v <= upto}
+    prev = 0
+    for hi, step in tiers:
+        v = (prev // step + 1) * step
+        while v <= upto and (hi is None or v <= hi): out.add(v); v += step
+        if hi is None or upto <= hi: break
+        prev = hi
+    return sorted(out)
+
 def ms_reached(tok, dollars):
-    out = [("tok", v) for v in (1_000_000, 10_000_000) if tok >= v]
-    v = 100_000_000
-    while v <= tok: out.append(("tok", v)); v += 100_000_000
-    v = 100
-    while v <= dollars: out.append(("usd", v)); v += 100
-    return out
+    return [("tok", v) for v in ms_values(MS_TOK_FIXED, MS_TOK_TIERS, tok)] + [("usd", v) for v in ms_values(MS_USD_FIXED, MS_USD_TIERS, dollars)]
 
 def check_ms(c):
     new = []
@@ -441,8 +486,12 @@ def stats(c, since=None):
         d = {"id": tid, "name": name, "start_ts": a, "end_ts": b, **tt(a, b)}
         if b is None and trip is None: trip = d
         elif b is not None: hist.append(d)
-    ms = [{"key": k, "kind": kd, "value": v, "reached_ts": rt, "acked": at is not None} for k, kd, v, rt, at in q("SELECT key,kind,value,reached_ts,acked_ts FROM milestones ORDER BY reached_ts, value")]
-    return {"records": R, "leaderboard": board(W) if since else L, "rng": rng, "sources": sources, "trip": trip, "trips": hist[:12], "milestones": ms,
+    rows = q("SELECT key,kind,value,reached_ts,acked_ts FROM milestones ORDER BY reached_ts, value")
+    top = {kd: max([v for _, k2, v, _, _ in rows if k2 == kd] or [0]) for kd in ("tok", "usd")}
+    sched = {"tok": set(ms_values(MS_TOK_FIXED, MS_TOK_TIERS, top["tok"])), "usd": set(ms_values(MS_USD_FIXED, MS_USD_TIERS, top["usd"]))}
+    # "sched": on the current schedule. Older, denser milestones stay in the table (never deleted) but are not badges or popups.
+    ms = [{"key": k, "kind": kd, "value": v, "reached_ts": rt, "acked": at is not None, "sched": int(v) in sched.get(kd, ())} for k, kd, v, rt, at in rows]
+    return {"records": R, "leaderboard": board(W) if since else L, "rng": rng, "sources": sources, "trip": trip, "trips": hist[:12], "milestones": ms, "ms_cfg": MS_CFG,
             "runtimes": runtimes_info(c)}
 
 def page_data():
@@ -471,7 +520,7 @@ def trip_reset(name):
         c.execute("INSERT INTO trips(name,start_ts) VALUES(NULL,?)", (now,)); c.commit(); c.close()
 
 def ms_ack(keys):
-    keys = [str(k) for k in (keys or [])][:500]
+    keys = [str(k) for k in (keys or [])][:5000]   # was 500: a long absence can leave more unseen milestones than that
     if not keys: return
     with lock:
         c = db(); c.executemany("UPDATE milestones SET acked_ts=? WHERE key=? AND acked_ts IS NULL", [(time.time(), k) for k in keys]); c.commit(); c.close()
@@ -750,7 +799,8 @@ function renderRt(){$('rts').innerHTML=(ST.runtimes||[]).filter(r=>r.ok||r.used&
 const bigNum=v=>v>=1e9?+(v/1e9).toFixed(1)+' BILLION':v>=1e6?+(v/1e6).toFixed(1)+' MILLION':fmt(v);
 function msName(m){return m.kind=='usd'?'$'+fmt(m.value)+' saved':bigNum(m.value).toLowerCase()+' tokens'}
 function renderMs(){$('msList').innerHTML=ST.milestones.map(m=>`<span class=chip title="${esc(when(m.reached_ts))}">${m.kind=='usd'?'💰':m.value>=1e9?'🌋':'🎉'} ${esc(msName(m))}</span>`).join('')||'<span class="chip soon">None yet. First stop: 1 million tokens. Then $100 saved.</span>'}
-function nextMilestone(){const tok=tin+tout,sv=hero?cost(hero,tin,tout):0;const nt=tok<1e6?1e6:tok<1e7?1e7:(Math.floor(tok/1e8)+1)*1e8,ns=(Math.floor(sv/100)+1)*100;
+function msNext(c,cur){let best=Infinity,prev=0;for(const v of c.fixed)if(v>cur&&v<best)best=v;for(const [hi,st] of c.tiers){const v=(Math.floor(Math.max(cur,prev)/st)+1)*st;if(hi==null||v<=hi){if(v<best)best=v;break}prev=hi}return best}
+function nextMilestone(){const tok=tin+tout,sv=hero?cost(hero,tin,tout):0,C=ST.ms_cfg;const nt=msNext(C.tok,tok),ns=msNext(C.usd,sv);
  $('nextMs').textContent=`Next party: ${bigNum(nt).toLowerCase()} tokens (${fmt(nt-tok)} to go)`+(hero?` · $${fmt(ns)} saved ($${(ns-sv).toFixed(2)} to go)`:'')}
 function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();nextMilestone()}
 let rT=null,lastR=0;function refreshSoon(){if(rT)return;rT=setTimeout(()=>{rT=null;lastR=Date.now();refreshNow()},Math.max(3000,10000-(Date.now()-lastR)))}
@@ -779,8 +829,12 @@ function confetti(n,ms){if(RM)return;const cv=$('conf'),x=cv.getContext('2d');cv
   if(alive)requestAnimationFrame(f)})(performance.now())}
 $('msX').onclick=e=>{e.stopPropagation();nextMs()};$('ms').onclick=nextMs;addEventListener('keydown',e=>{if(showing&&(e.key=='Escape'||e.key=='Enter'))nextMs()});
 $('msTest').onclick=()=>celebrate({kind:'tok',value:1e9,test:true});
-// milestones reached while nobody was watching: party once for the biggest of each kind, then mark all seen
-['tok','usd'].forEach(k=>{const p=ST.milestones.filter(m=>m.kind==k&&!m.acked);if(p.length){const top=p.reduce((a,b)=>b.value>a.value?b:a);celebrate({...top,also:p.map(m=>m.key)});p.forEach(m=>seenMs.add(m.key))}});
+// milestones reached while nobody was watching: never replay a backlog. At most ONE party, for the most recent one crossed
+// (on the current schedule), and every unseen milestone is marked seen either way
+{const p=ST.milestones.filter(m=>!m.acked),s=p.filter(m=>m.sched!==false);if(p.length){const keys=p.map(m=>m.key);
+ if(s.length){const top=s.reduce((a,b)=>(b.reached_ts>a.reached_ts||(b.reached_ts==a.reached_ts&&b.value>a.value))?b:a);celebrate({...top,also:keys})}
+ else fetch('api/milestones/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys})}).then(refreshSoon).catch(()=>{});
+ keys.forEach(k=>seenMs.add(k))}}
 // share card
 function fitText(x,t,w){if(x.measureText(t).width<=w)return t;while(t.length>1&&x.measureText(t+'…').width>w)t=t.slice(0,-1);return t+'…'}
 $('share').onclick=async()=>{const W=1200,H=630,cv=document.createElement('canvas');cv.width=W;cv.height=H;const x=cv.getContext('2d'),G='#76B900',SF='system-ui,sans-serif';

@@ -30,7 +30,7 @@ Anything that speaks `/v1/chat/completions`, `/v1/completions`, `/v1/responses` 
 - **Time filter**: 24 hours (rolling) / 7 days / 30 days / 60 days / 90 days / All time. Filters the odometer, the in/out/request/speed totals, cloud savings, model leaderboard, per-source chips and daily ledger, and dims calendar days outside the window. Your choice is remembered in the browser. Trophies and milestones always stay all-time.
 - **Model leaderboard** (apex predators) with per-source chips: tokens, requests, average and best tok/s, biggest single output.
 - **Trophy case**: 27 personal records (Speed Demon, Night Owl, Week of Wrath, Iron Streak, Reigning Champion...).
-- **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy: 1M and 10M tokens, every 100M, a much bigger Total Eradication show at every 1B, and every $100 saved. "🎉 test the party" in the footer previews it.
+- **Full-screen milestone celebrations** with a muted looping video, confetti and dramatic copy. They thin out as your totals grow: dollars saved every $100 to $1,000, every $500 to $10,000, then every $10,000; tokens at 1M, 10M, 100M and 500M, then whole billions only (every 1B to 10B, every 5B to 100B, every 50B after that). Opening the page never replays a backlog: at most one celebration, for the most recent milestone you missed, and the rest are marked seen. The schedule is configurable (`MS_*` below). "🎉 test the party" in the footer previews it.
 - **Current killing spree**: tokens, victims (requests), savings and average speed since you last pressed "☠ End this spree" (you can name it). Past sprees rest in "The mass graves". Nothing is ever deleted.
 - **📸 Share card**: previews a 1200x630 PNG of your carnage, then download it, copy it, or use your phone's share sheet (copy and share need https or localhost).
 - **Runtime status chips** next to the time filter: which proxies are up, and a warning when a runtime you have used stops answering.
@@ -190,6 +190,13 @@ Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAM
 | `LLAMA_MODEL` | `llama.cpp` | Model name until the log says which GGUF was loaded |
 | `LLAMA_STARTS` | empty | Optional comma-separated epoch start times for exact `--llama-backfill` timestamps |
 | `STATS_DB` | `./stats.db` | SQLite file |
+| `MS_USD_TIERS` | `1000:100,10000:500,*:10000` | Dollar-saved milestones as `upper_bound:step` pairs: every `step` up to `upper_bound`, then the next pair. `*` means no upper bound and goes last |
+| `MS_USD_FIXED` | empty | Extra one-off dollar milestones, comma-separated |
+| `MS_TOK_TIERS` | `10000000000:1000000000,100000000000:5000000000,*:50000000000` | Token milestones in the same format (every 1B to 10B, every 5B to 100B, then every 50B) |
+| `MS_TOK_FIXED` | `1000000,10000000,100000000,500000000` | One-off token milestones below the first tier |
+| `MS_PREVIEW` | `6` | Badges shown in the collapsed "Extinction events survived" row |
+
+Milestones that fall off a changed schedule are hidden, never deleted, and a malformed `MS_*` value is ignored with a warning. The defaults live in one block near the top of `token_annihilator.py`.
 
 ## Backfill Ollama history (optional)
 
