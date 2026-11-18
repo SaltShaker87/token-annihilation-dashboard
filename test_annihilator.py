@@ -1302,5 +1302,24 @@ class RestartEndToEndTests(unittest.TestCase):
             subprocess.run(["rm", "-rf", root], check=False)
 
 
+class TensorFoldTests(unittest.TestCase):
+    def test_probe_recognises_tensorfold_not_as_vllm(self):
+        s = Server(("127.0.0.1", 19190), Handler); s.queue = {}; s.seen = []
+        s.gets = {"/v1/models": '{"object":"list","data":[{"id":"qwen","owned_by":"tensorfold"}]}'}
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        try: self.assertEqual(ta.probe("127.0.0.1", 19190), "tensorfold")
+        finally: s.shutdown(); s.server_close()
+
+    def test_vllm_proxy_relabels_to_whichever_backend_answers(self):
+        saved = list(ta.RUNTIMES); H = type("Proxy_t", (ta.Proxy,), {"SRC": "vllm"}); real = ta.probe
+        try:
+            ta.RUNTIMES[:] = [{"src": "vllm", "listen": 1, "up": ("127.0.0.1", 1), "cls": H, "started": True}]
+            ta.probe = lambda h, p: "tensorfold"; ta.check_runtimes(); self.assertEqual((ta.RUNTIMES[0]["src"], H.SRC), ("tensorfold", "tensorfold"))
+            ta.probe = lambda h, p: "vllm"; ta.check_runtimes(); self.assertEqual((ta.RUNTIMES[0]["src"], H.SRC), ("vllm", "vllm"))
+            ta.probe = lambda h, p: "llamacpp"; ta.check_runtimes(); self.assertEqual(H.SRC, "vllm")   # never relabelled to an unrelated engine
+        finally: ta.probe = real; ta.RUNTIMES[:] = saved
+        self.assertEqual(ta.SOURCE_LABELS["tensorfold"], "TensorFold")
+
+
 if __name__ == "__main__":
     unittest.main()

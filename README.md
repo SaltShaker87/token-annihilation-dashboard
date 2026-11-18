@@ -14,6 +14,7 @@ Backends supported, each with its own source label:
 |---|---|---|
 | **Ollama** | Transparent proxy (default `:11435` -> `:11434`) | Ollama |
 | **vLLM** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | vLLM |
+| **TensorFold** (MiaAI-Lab's Zig engine, OpenAI-compatible) | Same counting proxy as vLLM. Detected from `owned_by: tensorfold` in `/v1/models` or a `Server: TensorFold` header | TensorFold |
 | **llama.cpp** (`llama-server`) | Read-only read of llama-server's log. Default file: `~/pixpilot/run/server.log`. The 8081 proxy is optional and stays off while a log path is set | llama.cpp |
 | **NVIDIA NIM / NeMo, TensorRT-LLM, Triton (OpenAI front end), SGLang, LM Studio** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | NVIDIA NIM, NeMo, TensorRT-LLM, ... |
 | **ONNX Runtime** (Foundry Local, onnxruntime-genai OpenAI servers) | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | ONNX Runtime |
@@ -119,6 +120,8 @@ Automatic: as soon as vLLM answers on port 8000, a counting proxy opens on **800
 ```bash
 OPENAI_PROXIES="vllm:8001=spark-1:8000" python3 token_annihilator.py
 ```
+
+Swapping vLLM and TensorFold on the same port is fine: the proxy is relabelled to whichever one answers (re-checked every 30 s), so each new request is logged under the right name. Old rows keep the label they were logged with. Other engines are never relabelled.
 
 The proxy reads the `usage` field from every response. For streaming requests it automatically adds `"stream_options": {"include_usage": true}` (only when the client did not set `stream_options` itself) so the final chunk carries the token counts. Disable that with `INJECT_USAGE=0`. vLLM reports no timings, so for streamed requests the speed (tok/s) is measured from the first to the last streamed chunk.
 

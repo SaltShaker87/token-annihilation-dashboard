@@ -50,7 +50,7 @@ def db():
 
 # Rows that count. Only the token-less journal backfill is hidden; any future source (e.g. llama.cpp) is included automatically.
 V = "source!='backfill'"
-SOURCE_LABELS = {"proxy": "Ollama", "ollama": "Ollama", "llamacpp": "llama.cpp", "vllm": "vLLM", "nim": "NVIDIA NIM", "nemo": "NeMo",
+SOURCE_LABELS = {"proxy": "Ollama", "ollama": "Ollama", "llamacpp": "llama.cpp", "vllm": "vLLM", "tensorfold": "TensorFold", "nim": "NVIDIA NIM", "nemo": "NeMo",
                  "trtllm": "TensorRT-LLM", "triton": "Triton", "onnx": "ONNX Runtime", "sglang": "SGLang", "lmstudio": "LM Studio",
                  "openai": "OpenAI-compatible"}   # any other OPENAI_PROXIES name is shown as written
 TOT = [0, 0]         # running all-time (input, output) for milestone checks
@@ -235,11 +235,14 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                     LIVE.pop(rid, None); live_bump()
     do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = do_OPTIONS = do_PATCH = handle_any
 
+SWAPPABLE = ("vllm", "tensorfold")   # backends that may take turns behind one proxy port; the probe decides which label applies
+
 def probe(host, port):
-    """Who answers at host:port? 'ollama' / 'vllm' / 'llamacpp', 'up' (something else), or None (nothing)."""
+    """Who answers at host:port? 'ollama' / 'vllm' / 'tensorfold' / 'llamacpp', 'up' (something else), or None (nothing)."""
+    hdr = {}
     def get(path):
         c = http.client.HTTPConnection(host, port, timeout=2)
-        try: c.request("GET", path); r = c.getresponse(); return r.status, r.read(1_000_000)
+        try: c.request("GET", path); r = c.getresponse(); hdr["server"] = (r.getheader("Server") or "").lower(); return r.status, r.read(1_000_000)
         finally: c.close()
     try:
         s, b = get("/api/version")
@@ -247,6 +250,8 @@ def probe(host, port):
         s, b = get("/v1/models")
         try: owners = {str(m.get("owned_by", "")).lower() for m in json.loads(b).get("data", [])} if s == 200 else set()
         except Exception: owners = set()
+        # TensorFold (MiaAI-Lab's Zig engine, not a vLLM fork) says so in /v1/models owned_by and in its Server header
+        if "tensorfold" in owners or "tensorfold" in hdr.get("server", ""): return "tensorfold"
         for k in ("vllm", "llamacpp"):
             if k in owners: return k
         return "up"
@@ -258,10 +263,17 @@ def check_runtimes():
         if rt.get("error"): continue
         kind = probe(*rt["up"])
         if not rt["started"]:   # a default proxy claims its port only once the right runtime answers upstream
-            if kind == rt["src"]: bind_proxy(rt)
+            if kind == rt["src"] or (kind in SWAPPABLE and rt["src"] in SWAPPABLE):
+                if kind != rt["src"]: rt["src"] = rt["cls"].SRC = kind
+                bind_proxy(rt)
             rt["ok"], rt["kind"] = rt["started"], kind
             continue
         rt["ok"], rt["kind"] = kind is not None, kind
+        # vLLM and TensorFold are interchangeable OpenAI-compatible servers on the same upstream port (we swap which one
+        # runs there): relabel the proxy, and so every row it logs from now on, by whichever one actually answers
+        if rt["cls"] is not Proxy and kind in SWAPPABLE and rt["src"] in SWAPPABLE and kind != rt["src"]:
+            print("upstream %s:%d is now %s (was %s)" % (rt["up"][0], rt["up"][1], SOURCE_LABELS.get(kind, kind), SOURCE_LABELS.get(rt["src"], rt["src"])), flush=True)
+            rt["src"] = rt["cls"].SRC = kind
         # the :11435 proxy is Ollama's by default, but people point it at vLLM too: label by what actually answers
         if rt["cls"] is Proxy and not PROXY_SOURCE and kind in ("ollama", "vllm", "llamacpp"):
             Proxy.SRC = rt["src"] = "proxy" if kind == "ollama" else kind
