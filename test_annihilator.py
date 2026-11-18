@@ -396,6 +396,7 @@ class ProxyTests(unittest.TestCase):
         self.assertIn('src="static/icon.webp"', text); self.assertIn("static/splash.mp4", text)
         self.assertIn("esc(x.model)", text)   # model names are HTML-escaped client-side; embedded JSON escapes "</"
         self.assertIn("id=setBtn", text); self.assertIn("id=setDlg", text)   # settings gear + window
+        self.assertIn("viewport-fit=cover", text); self.assertIn("id=setScroll", text); self.assertIn("100dvh", text)   # mobile-safe settings window
         self.assertIn("id=msToggle", text); self.assertIn('class="chips one" id=msList', text)   # badges start collapsed
         self.assertIn("id=updBtn", text); self.assertIn(">Update</button>", text)
         self.assertIn('"version": "%s"' % ta.read_version(), text); self.assertIn('"boot":', text)
