@@ -1454,5 +1454,25 @@ class SettingsApiTests(unittest.TestCase):
         self.stop()
 
 
+class FailedRequestTests(unittest.TestCase):
+    """Rejected requests (e.g. a probe with a short model alias that the backend answers with HTTP 400) must not become model rows."""
+    def test_failed_probes_are_kept_but_not_counted_as_models(self):
+        tmp = tempfile.mkdtemp(prefix="annihilator-failed-"); saved = (ta.DB, ta.TOT[0], ta.TOT[1])
+        try:
+            ta.DB = os.path.join(tmp, "s.db"); ta.TOT[0] = ta.TOT[1] = 0
+            ta.init_db(); c = ta.db(); now = time.time()
+            rows = [(now - 50, "big/Full-Model-Name", "/v1/chat/completions", 100, 50, 1.0, 0.5, 200, "vllm"),
+                    (now - 40, "other/Full-Name", "/v1/chat/completions", 10, 5, 1.0, 0.5, 200, "bolt"),
+                    (now - 30, "qwen", "/v1/chat/completions", None, None, 0.002, None, 400, "vllm"),
+                    (now - 30, "bolt", "/v1/chat/completions", None, None, 0.01, None, 400, "bolt"),
+                    (now - 30, "llm4d", "/v1/chat/completions", None, None, 0.02, None, 400, "llm4d")]
+            c.executemany("INSERT INTO requests(ts,model,endpoint,input_tokens,output_tokens,duration_s,eval_s,status,source) VALUES(?,?,?,?,?,?,?,?,?)", rows); c.commit(); c.close()
+            for j in (ta.api_stats(), ta.api_stats(time.time() - 86400)):
+                self.assertEqual(sorted(m["model"] for m in j["leaderboard"]), ["big/Full-Model-Name", "other/Full-Name"])
+                self.assertEqual(j["rng"]["nreq"], 2); self.assertEqual({s["src"] for s in j["sources"]}, {"vllm", "bolt"})
+            self.assertEqual(sqlite3.connect(ta.DB).execute("SELECT COUNT(*) FROM requests").fetchone()[0], 5)   # nothing deleted
+        finally: ta.DB, ta.TOT[0], ta.TOT[1] = saved
+
+
 if __name__ == "__main__":
     unittest.main()

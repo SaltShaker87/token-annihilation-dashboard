@@ -49,7 +49,9 @@ def db():
     return c
 
 # Rows that count. Only the token-less journal backfill is hidden; any future source (e.g. llama.cpp) is included automatically.
-V = "source!='backfill'"
+# Failed requests (HTTP 400 and up) carry no tokens and are not inference: a rejected probe such as {"model": "qwen"} sent to a
+# proxy must not show up as a one-request "model". They stay in the table (nothing is deleted), they are just not counted.
+V = "source!='backfill' AND COALESCE(status,200)<400"
 SOURCE_LABELS = {"proxy": "Ollama", "ollama": "Ollama", "llamacpp": "llama.cpp", "vllm": "vLLM", "tensorfold": "TensorFold", "nim": "NVIDIA NIM", "nemo": "NeMo",
                  "trtllm": "TensorRT-LLM", "triton": "Triton", "onnx": "ONNX Runtime", "sglang": "SGLang", "lmstudio": "LM Studio",
                  "openai": "OpenAI-compatible"}   # any other OPENAI_PROXIES name is shown as written
