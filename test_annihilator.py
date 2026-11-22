@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Stdlib checks for the Ollama, vLLM and llama.cpp token counting. Run: python3 test_annihilator.py"""
-import http.client, http.server, json, os, socket, sqlite3, subprocess, sys, tempfile, threading, time, unittest
+"""Stdlib checks for the Ollama, vLLM, SGLang and llama.cpp token counting. Run: python3 test_annihilator.py"""
+import contextlib, http.client, http.server, io, json, os, socket, sqlite3, subprocess, sys, tempfile, threading, time, unittest
 from socketserver import ThreadingMixIn
 
 os.environ.setdefault("DASH_BIND", "127.0.0.1")
@@ -50,6 +50,21 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(ta.add_usage_opt("/v1/chat/completions", b'{"stream":true,"stream_options":{}}'), b'{"stream":true,"stream_options":{}}')
         self.assertEqual(ta.add_usage_opt("/api/chat", b'{"stream":true}'), b'{"stream":true}')
         self.assertEqual(ta.add_usage_opt("/v1/chat/completions", b'not json'), b'not json')
+        # /v1/completions is what `vllm bench serve` calls. Same ask, and an ask the client already made is left alone.
+        out = json.loads(ta.add_usage_opt("/v1/completions", b'{"model":"m","prompt":"hi","stream":true}'))
+        self.assertEqual(out["stream_options"], {"include_usage": True})
+        already = b'{"stream":true,"stream_options":{"include_usage":true}}'
+        self.assertEqual(ta.add_usage_opt("/v1/completions", already), already)
+        self.assertEqual(ta.add_usage_opt("/v1/completions", b'{"stream":false}'), b'{"stream":false}')
+
+    def test_vllm_bench_completions_usage(self):
+        # The shape vLLM and SGLang send: a chunk with usage null, then a chunk that carries the counts, then [DONE].
+        body = ('data: {"id":"cmpl","object":"text_completion","model":"Inkling-2-Mini","choices":[{"text":"hi","index":0}],"usage":null}\n\n'
+                'data: {"id":"cmpl","object":"text_completion","model":"Inkling-2-Mini","choices":[],"usage":{"prompt_tokens":12,"total_tokens":20,"completion_tokens":8}}\n\n'
+                'data: [DONE]\n')
+        self.assertEqual(parse(body, b'{"model":"Inkling-2-Mini","prompt":"hi","stream":true}'), ("Inkling-2-Mini", 12, 8, None))
+        plain = '{"id":"cmpl","object":"text_completion","model":"Inkling-2-Mini","choices":[{"text":"hi"}],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}'
+        self.assertEqual(parse(plain)[:3], ("Inkling-2-Mini", 5, 6))
 
 
 def _llama_req(task, prompt, out, n_tokens, load=None, prefix="", eval_ms=200.0):
@@ -1322,6 +1337,249 @@ class TensorFoldTests(unittest.TestCase):
             ta.probe = lambda h, p: "llamacpp"; ta.check_runtimes(); self.assertEqual(H.SRC, "vllm")   # never relabelled to an unrelated engine
         finally: ta.probe = real; ta.RUNTIMES[:] = saved
         self.assertEqual(ta.SOURCE_LABELS["tensorfold"], "TensorFold")
+
+
+class HeaderHandler(Handler):
+    """Says SGLang in the Server header, and nothing useful in owned_by."""
+    def version_string(self):
+        return "sglang/0.5.0"
+
+
+def _free_port():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+
+
+class VllmSglangTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vllm-sglang-")
+        self.saved = (ta.DB, tuple(ta.TOT), dict(ta.LIVE), list(ta.DONE), ta.LIVE_VER[0], ta._rid[0],
+                      list(ta.RUNTIMES), ta.PROXY_BIND, ta.Proxy.SRC, ta.OPENAI_PROXIES, list(ta.ENGINES), ta.LLAMA_LOG, dict(os.environ))
+        ta.DB = os.path.join(self.tmp, "s.db")
+        ta.LIVE.clear(); ta.DONE.clear(); ta.RUNTIMES[:] = []; ta.init_db()
+        self.servers = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for s in self.servers:
+            try: s.shutdown(); s.server_close()
+            except Exception: pass
+        for rt in list(ta.RUNTIMES):
+            srv = rt.get("srv")
+            if srv:
+                try: srv.shutdown(); srv.server_close()
+                except Exception: pass
+        db, tot, live, done, ver, rid, rts, bind, src, proxies, engines, log, env = self.saved
+        ta.DB = db; ta.TOT[:] = tot; ta.LIVE.clear(); ta.LIVE.update(live); ta.DONE[:] = done
+        ta.LIVE_VER[0] = ver; ta._rid[0] = rid; ta.RUNTIMES[:] = rts; ta.PROXY_BIND = bind
+        ta.Proxy.SRC = src; ta.OPENAI_PROXIES = proxies; ta.ENGINES[:] = engines; ta.LLAMA_LOG = log
+        os.environ.clear(); os.environ.update(env)
+
+    def _upstream(self, reply, models, handler=Handler):
+        s = Server(("127.0.0.1", 0), handler)
+        s.queue = {"/v1/completions": [reply], "/v1/chat/completions": [reply], "/api/chat": [reply]}
+        s.seen = []; s.gets = {"/v1/models": models, "/api/version": '{"error":"nope"}'}
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        self.servers.append(s)
+        return s
+
+    def _proxy(self, src, up_port):
+        H = type("Proxy_" + src, (ta.Proxy,), {"UPH": "127.0.0.1", "UPP": up_port, "SRC": src})
+        px = ta.TS(("127.0.0.1", 0), H)
+        threading.Thread(target=px.serve_forever, daemon=True).start()
+        self.servers.append(px)
+        return px
+
+    def _rows(self):
+        return sqlite3.connect(ta.DB).execute(
+            "SELECT source, model, endpoint, input_tokens, output_tokens FROM requests ORDER BY id").fetchall()
+
+    def _count(self, src, path, payload, reply):
+        up = self._upstream(reply, '{"object":"list","data":[{"id":"Inkling-2-Mini","owned_by":"%s"}]}' % src)
+        px = self._proxy(src, up.server_address[1])
+        before = len(self._rows())
+        st, body = req(px.server_address[1], "POST", path, payload)
+        self.assertEqual(st, 200)
+        rows = self._rows(); deadline = time.time() + 3
+        while time.time() < deadline and len(rows) < before + 1:
+            rows = self._rows(); time.sleep(0.02)
+        self.assertEqual(len(rows), before + 1, rows)
+        return rows[-1], up.seen[-1][1], body
+
+    def test_builtin_ports_and_custom_ports(self):
+        ta.OPENAI_PROXIES = None
+        ta.ENGINES[:] = ["ollama", "vllm", "sglang", "llamacpp"]
+        ta.LLAMA_LOG = "/tmp/llama-kept-on-the-log.log"   # log tail counts llama.cpp, so no 8081 proxy
+        for k in ta.LEGACY_ENV: os.environ.pop(k, None)
+        self.assertEqual(ta.proxy_specs(), "vllm:8001=127.0.0.1:8000,sglang:30001=127.0.0.1:30000")
+        self.assertTrue(ta.auto_proxies())   # nothing chosen by hand: wait until the server answers
+        os.environ["VLLM_UPSTREAM_PORT"] = "8010"; os.environ["VLLM_PROXY_PORT"] = "8011"
+        os.environ["SGLANG_UPSTREAM_HOST"] = "spark.local"; os.environ["SGLANG_UPSTREAM_PORT"] = "30000"; os.environ["SGLANG_PROXY_PORT"] = "30011"
+        self.assertEqual(ta.proxy_specs(), "vllm:8011=127.0.0.1:8010,sglang:30011=spark.local:30000")
+        self.assertFalse(ta.auto_proxies())   # a port was set by hand: open the counting ports now
+        ta.ENGINES[:] = ["ollama", "vllm", "llamacpp"]   # an older ENGINES list does not grow an SGLang proxy
+        ta.LLAMA_LOG = "/tmp/llama-kept-on-the-log.log"
+        for k in ("VLLM_PROXY_PORT", "VLLM_UPSTREAM_PORT", "VLLM_UPSTREAM_HOST"): os.environ.pop(k, None)
+        self.assertEqual(ta.proxy_specs(), "vllm:8001=127.0.0.1:8000")
+        ta.LLAMA_LOG = ""
+        self.assertIn("llamacpp:8081=127.0.0.1:8080", ta.proxy_specs())
+        self.assertNotIn("sglang", ta.proxy_specs())
+        # A fresh process with no port settings uses the same defaults.
+        code = "import token_annihilator as ta; print(','.join(ta.ENGINES)); print(ta.proxy_specs())"
+        env = {k: v for k, v in os.environ.items() if k not in ta.LEGACY_ENV and k != "OPENAI_PROXIES"}
+        env["LLAMA_LOG"] = "/tmp/llama-kept-on-the-log.log"
+        got = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(got.stdout.splitlines(), ["ollama,vllm,sglang,llamacpp", "vllm:8001=127.0.0.1:8000,sglang:30001=127.0.0.1:30000"])
+
+    def test_probe_recognises_sglang(self):
+        sg = self._upstream('{"ok":true}', '{"object":"list","data":[{"id":"Inkling-2-Mini","owned_by":"sglang"}]}')
+        self.assertEqual(ta.probe("127.0.0.1", sg.server_address[1]), "sglang")
+        vl = self._upstream('{"ok":true}', '{"object":"list","data":[{"id":"qwen","owned_by":"vllm"}]}')
+        self.assertEqual(ta.probe("127.0.0.1", vl.server_address[1]), "vllm")
+        hdr = self._upstream('{"ok":true}', '{"object":"list","data":[{"id":"m","owned_by":"someone"}]}', HeaderHandler)
+        self.assertEqual(ta.probe("127.0.0.1", hdr.server_address[1]), "sglang")
+
+    def test_completions_and_chat_count_for_vllm_and_sglang(self):
+        plain = '{"id":"cmpl","object":"text_completion","model":"Inkling-2-Mini","choices":[{"text":"hi"}],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}'
+        row, sent, body = self._count("vllm", "/v1/completions", {"model": "Inkling-2-Mini", "prompt": "hello", "max_tokens": 8}, plain)
+        self.assertEqual(row, ("vllm", "Inkling-2-Mini", "/v1/completions", 5, 6))
+        self.assertNotIn(b"stream_options", sent)   # a normal request is forwarded unchanged
+        bench = [
+            'data: {"id":"cmpl","object":"text_completion","model":"Inkling-2-Mini","choices":[{"text":"a","index":0}],"usage":null}\n\n',
+            'data: {"id":"cmpl","object":"text_completion","model":"Inkling-2-Mini","choices":[],"usage":{"prompt_tokens":12,"total_tokens":20,"completion_tokens":8}}\n\n',
+            'data: [DONE]\n\n']
+        asked = {"model": "Inkling-2-Mini", "prompt": "hello", "max_tokens": 8, "stream": True, "stream_options": {"include_usage": True}}
+        row, sent, body = self._count("vllm", "/v1/completions", asked, bench)
+        self.assertEqual(row, ("vllm", "Inkling-2-Mini", "/v1/completions", 12, 8))
+        self.assertIn(b"[DONE]", body)
+        self.assertEqual(json.loads(sent)["stream_options"], {"include_usage": True})   # bench serve's own ask is kept
+        chat = [
+            'data: {"model":"Inkling-2-Mini","choices":[{"delta":{"content":"yo"}}],"usage":null}\n\n',
+            'data: {"model":"Inkling-2-Mini","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n',
+            'data: [DONE]\n\n']
+        row, sent, body = self._count("sglang", "/v1/chat/completions", {"model": "Inkling-2-Mini", "messages": [{"role": "user", "content": "hi"}], "stream": True}, chat)
+        self.assertEqual(row, ("sglang", "Inkling-2-Mini", "/v1/chat/completions", 3, 4))
+        self.assertEqual(json.loads(sent)["stream_options"], {"include_usage": True})   # added, because the client did not ask
+        comp = [
+            'data: {"model":"Inkling-2-Mini","choices":[{"text":"z"}],"usage":null}\n\n',
+            'data: {"model":"Inkling-2-Mini","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}\n\n',
+            'data: [DONE]\n\n']
+        row, sent, _ = self._count("sglang", "/v1/completions", {"model": "Inkling-2-Mini", "prompt": "go", "stream": True}, comp)
+        self.assertEqual(row, ("sglang", "Inkling-2-Mini", "/v1/completions", 9, 2))
+        self.assertEqual(json.loads(sent)["stream_options"], {"include_usage": True})
+        quiet = '{"model":"Inkling-2-Mini","choices":[{"message":{"content":"yo"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}'
+        row, sent, _ = self._count("sglang", "/v1/chat/completions", {"model": "Inkling-2-Mini", "messages": [{"role": "user", "content": "hi"}]}, quiet)
+        self.assertEqual(row, ("sglang", "Inkling-2-Mini", "/v1/chat/completions", 2, 1))
+        self.assertNotIn(b"stream_options", sent)
+        self.assertEqual(ta.SOURCE_LABELS["sglang"], "SGLang")
+        self.assertEqual(ta.SOURCE_LABELS["vllm"], "vLLM")
+
+    def test_sglang_proxy_waits_until_sglang_answers(self):
+        other = self._upstream('{"ok":true}', '{"object":"list","data":[{"id":"qwen","owned_by":"vllm"}]}')
+        sg = self._upstream('{"ok":true}', '{"object":"list","data":[{"id":"m","owned_by":"sglang"}]}')
+        ta.PROXY_BIND = "127.0.0.1"
+        listen = _free_port()
+        H = type("Proxy_sglang", (ta.Proxy,), {"UPH": "127.0.0.1", "UPP": other.server_address[1], "SRC": "sglang"})
+        ta.start_proxy(H, "sglang", listen, ("127.0.0.1", other.server_address[1]), auto=True)
+        ta.check_runtimes()
+        self.assertFalse(ta.RUNTIMES[0]["started"])
+        with self.assertRaises(OSError): req(listen, "GET", "/v1/models")
+        ta.RUNTIMES[0]["up"] = ("127.0.0.1", sg.server_address[1]); H.UPP = sg.server_address[1]
+        ta.check_runtimes()
+        self.assertTrue(ta.RUNTIMES[0]["started"]); self.assertEqual(H.SRC, "sglang")
+
+    def test_labels_follow_the_server_and_do_not_swap_unrelated_engines(self):
+        sg = self._upstream('{"ok":true}', '{"object":"list","data":[{"id":"m","owned_by":"sglang"}]}')
+        ta.RUNTIMES[:] = [{"src": "proxy", "listen": 1, "up": ("127.0.0.1", sg.server_address[1]), "cls": ta.Proxy, "started": True}]
+        ta.check_runtimes(); self.assertEqual((ta.RUNTIMES[0]["src"], ta.Proxy.SRC), ("sglang", "sglang"))
+        H = type("Proxy_sglang", (ta.Proxy,), {"SRC": "sglang"})
+        ta.RUNTIMES[:] = [{"src": "sglang", "listen": 1, "up": ("127.0.0.1", 1), "cls": H, "started": True}]
+        real = ta.probe
+        try:
+            ta.probe = lambda h, p: "vllm"; ta.check_runtimes(); self.assertEqual((ta.RUNTIMES[0]["src"], H.SRC), ("sglang", "sglang"))
+        finally: ta.probe = real
+
+    def test_busy_listen_port_skips_that_proxy_only(self):
+        held = socket.socket(); held.bind(("127.0.0.1", 0)); held.listen(1); self.addCleanup(held.close)
+        busy, free = held.getsockname()[1], _free_port()
+        ta.PROXY_BIND = "127.0.0.1"
+        err = io.StringIO()
+        nim = type("Proxy_nim", (ta.Proxy,), {"UPH": "127.0.0.1", "UPP": 9, "SRC": "nim"})
+        sg = type("Proxy_sglang", (ta.Proxy,), {"UPH": "127.0.0.1", "UPP": 9, "SRC": "sglang"})
+        with contextlib.redirect_stderr(err):
+            ta.start_proxy(nim, "nim", busy, ("127.0.0.1", 9))
+            ta.start_proxy(sg, "sglang", free, ("127.0.0.1", 9))
+        text = err.getvalue()
+        self.assertFalse(ta.RUNTIMES[0]["started"])
+        self.assertEqual(ta.RUNTIMES[0]["error"], "port %d busy" % busy)
+        self.assertIn("warning: NVIDIA NIM proxy skipped: port %d is already in use" % busy, text)
+        self.assertIn("The dashboard and the other proxies keep running.", text)
+        self.assertIn("Change its listen port in OPENAI_PROXIES.", text)
+        self.assertTrue(ta.RUNTIMES[1]["started"]); self.assertIsNone(ta.RUNTIMES[1].get("error"))
+        ta.check_runtimes()   # a skipped proxy stays skipped; the other one is left running
+        self.assertEqual(ta.RUNTIMES[0]["error"], "port %d busy" % busy)
+        self.assertTrue(ta.RUNTIMES[1]["started"])
+
+    def _stop(self, proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try: proc.wait(timeout=3)
+            except subprocess.TimeoutExpired: proc.kill()
+        try: proc.stdout.close()
+        except Exception: pass
+
+    def test_busy_port_does_not_stop_the_dashboard_or_the_other_counters(self):
+        held = socket.socket(); held.bind(("127.0.0.1", 0)); held.listen(1); self.addCleanup(held.close)
+        busy = held.getsockname()[1]
+        dash, opx, up_ol, spx, up_sg = (_free_port() for _ in range(5))
+        ol = Server(("127.0.0.1", up_ol), Handler)
+        ol.queue = {"/api/chat": ['{"model":"llama3","done":true,"prompt_eval_count":4,"eval_count":6,"eval_duration":1000000000}']}
+        ol.seen = []; ol.gets = {"/api/version": '{"version":"0.12.0"}'}
+        threading.Thread(target=ol.serve_forever, daemon=True).start(); self.servers.append(ol)
+        sg = Server(("127.0.0.1", up_sg), Handler)
+        sg.queue = {"/v1/completions": ['{"model":"Inkling-2-Mini","usage":{"prompt_tokens":11,"completion_tokens":13,"total_tokens":24}}']}
+        sg.seen = []; sg.gets = {"/v1/models": '{"object":"list","data":[{"id":"Inkling-2-Mini","owned_by":"sglang"}]}'}
+        threading.Thread(target=sg.serve_forever, daemon=True).start(); self.servers.append(sg)
+        db = os.path.join(self.tmp, "dash.db")
+        env = dict(os.environ, STATS_DB=db, DASH_BIND="127.0.0.1", DASH_PORT=str(dash), PROXY_BIND="127.0.0.1",
+                   PROXY_PORT=str(opx), UPSTREAM_HOST="127.0.0.1", UPSTREAM_PORT=str(up_ol),
+                   OLLAMA_PROXY="1", LLAMA_LOG="",
+                   OPENAI_PROXIES="vllm:%d=127.0.0.1:9,sglang:%d=127.0.0.1:%d" % (busy, spx, up_sg))
+        proc = subprocess.Popen([sys.executable, os.path.join(HERE, "token_annihilator.py")], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(self._stop, proc)
+        boot = ""; deadline = time.time() + 8
+        while time.time() < deadline and "Ollama proxy" not in boot:
+            line = proc.stdout.readline()
+            if not line: break
+            boot += line
+        self.assertIn("warning: vLLM proxy skipped: port %d is already in use" % busy, boot, boot)
+        self.assertIn("The dashboard and the other proxies keep running.", boot)
+        self.assertIn("Set VLLM_PROXY_PORT to a free port.", boot)
+        self.assertIn("SGLang proxy 127.0.0.1:%d -> 127.0.0.1:%d" % (spx, up_sg), boot)
+        self.assertIn("Ollama proxy 127.0.0.1:%d -> 127.0.0.1:%d" % (opx, up_ol), boot)
+        up = False; deadline = time.time() + 8
+        while time.time() < deadline and not up:
+            try: up = req(dash, "GET", "/api/stats")[0] == 200
+            except Exception: time.sleep(0.05)
+        self.assertTrue(up, boot)
+        self.assertIsNone(proc.poll(), boot)
+        self.assertEqual(req(opx, "POST", "/api/chat", {"model": "llama3"})[0], 200)
+        self.assertEqual(req(spx, "POST", "/v1/completions", {"model": "Inkling-2-Mini", "prompt": "hi"})[0], 200)
+        st, page = req(dash, "GET", "/"); self.assertEqual(st, 200); text = page.decode()
+        self.assertIn("port %d busy" % busy, text)
+        self.assertIn("r.ok||r.error||r.used&&r.ok===false", text)
+        rows = []; deadline = time.time() + 3
+        while time.time() < deadline and len(rows) < 2:
+            rows = sqlite3.connect(db).execute("SELECT source, model, input_tokens, output_tokens FROM requests ORDER BY id").fetchall(); time.sleep(0.05)
+        self.assertEqual(rows, [("proxy", "llama3", 4, 6), ("sglang", "Inkling-2-Mini", 11, 13)])
+        j = json.loads(req(dash, "GET", "/api/stats")[1])
+        rts = {r["label"]: r for r in j["runtimes"]}
+        self.assertEqual(rts["vLLM"]["error"], "port %d busy" % busy)
+        self.assertTrue(rts["SGLang"]["ok"]); self.assertTrue(rts["Ollama"]["ok"])
+        labels = {s["label"]: s["tok"] for s in j["sources"]}
+        self.assertEqual(labels, {"Ollama": 10, "SGLang": 24})
+        self.assertIsNone(proc.poll())
 
 
 class MilestoneScheduleTests(unittest.TestCase):

@@ -1,5 +1,5 @@
 [Unit]
-Description=Token Annihilation Dashboard (Ollama / vLLM / llama.cpp token counter)
+Description=Token Annihilation Dashboard (Ollama / vLLM / SGLang / llama.cpp token counter)
 After=network-online.target
 
 [Service]
@@ -7,13 +7,21 @@ After=network-online.target
 # A copy started by hand reloads itself instead, so Restart= is not required for the update.
 WorkingDirectory=%h/token-annihilation-dashboard
 # Uncomment and edit what you use (see README):
-# Ollama :11435 runs by default. vLLM :8001 opens once vLLM answers on 8000.
+# Ollama :11435 runs by default.
+# vLLM :8001 opens once vLLM answers on 8000. SGLang :30001 opens once SGLang answers on 30000.
+# If that counting port is already taken, that one proxy is skipped with a warning. The page and the others keep running.
+# vLLM on 8010, and 8001 already taken, so programs use 8011:
+# Environment=VLLM_UPSTREAM_PORT=8010
+# Environment=VLLM_PROXY_PORT=8011
+# SGLang on a different port, or 30001 already taken:
+# Environment=SGLANG_UPSTREAM_PORT=30000
+# Environment=SGLANG_PROXY_PORT=30011
 # llama.cpp is counted by reading llama-server's log (read only). Default is ~/pixpilot/run/server.log.
 # A missing file is fine. Set LLAMA_LOG empty to turn the tail off and use the automatic :8081 proxy instead.
 # Environment=LLAMA_LOG=%h/pixpilot/run/server.log
 # Environment=LLAMA_LOG=
-# To list your own proxies instead (started right away, e.g. vLLM + NVIDIA NIM):
-# Environment=OPENAI_PROXIES=vllm:8001=127.0.0.1:8000,nim:8002=127.0.0.1:9000
+# To list your own proxies instead (started right away, e.g. vLLM + SGLang + NVIDIA NIM):
+# Environment=OPENAI_PROXIES=vllm:8011=127.0.0.1:8010,sglang:30001=127.0.0.1:30000,nim:8002=127.0.0.1:9000
 # llama.cpp only, proxy fixed on 8081 (server stays on 8080, clients use 8081). Turn the log tail off too:
 # Environment=LLAMA_LOG=
 # Environment=OPENAI_PROXIES=llamacpp:8081=127.0.0.1:8080

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Token Annihilation Dashboard: transparent token-counting proxies (Ollama, vLLM, llama.cpp / any
+"""Token Annihilation Dashboard: transparent token-counting proxies (Ollama, vLLM, SGLang, llama.cpp / any
 OpenAI-compatible server) + llama.cpp log tailing + a tiny, gloriously dramatic dashboard. Stdlib only.
 MIT licensed. https://github.com/SaltShaker87/token-annihilation-dashboard"""
-import ast, fcntl, http.client, http.server, json, os, re, sqlite3, stat, subprocess, sys, threading, time, html, urllib.error, urllib.request
+import ast, errno, fcntl, http.client, http.server, json, os, re, sqlite3, stat, subprocess, sys, threading, time, html, urllib.error, urllib.request
 from datetime import datetime
 from socketserver import ThreadingMixIn
 
@@ -13,9 +13,10 @@ DB = os.environ.get("STATS_DB", DB)
 UP_HOST, UP_PORT = os.environ.get("UPSTREAM_HOST", "127.0.0.1"), int(os.environ.get("UPSTREAM_PORT", 11434))   # Ollama
 PROXY_BIND, PROXY_PORT = os.environ.get("PROXY_BIND", "0.0.0.0"), int(os.environ.get("PROXY_PORT", 11435))
 # Older builds picked runtimes with ENGINES=ollama,vllm,llamacpp (+ VLLM_* / LLAMACPP_* ports). Still honoured.
+# SGLang is a first-class default too: SGLANG_PROXY_PORT / SGLANG_UPSTREAM_* (30001 -> 127.0.0.1:30000).
 ENGINES = [{"llama.cpp": "llamacpp", "llama-cpp": "llamacpp", "llama": "llamacpp"}.get(x.strip().lower(), x.strip().lower())
-           for x in os.environ.get("ENGINES", "ollama,vllm,llamacpp").split(",") if x.strip()]
-OLLAMA_PROXY = os.environ.get("OLLAMA_PROXY", "1" if "ollama" in ENGINES else "0") != "0"   # set 0 if you only run vLLM / llama.cpp
+           for x in os.environ.get("ENGINES", "ollama,vllm,sglang,llamacpp").split(",") if x.strip()]
+OLLAMA_PROXY = os.environ.get("OLLAMA_PROXY", "1" if "ollama" in ENGINES else "0") != "0"   # set 0 if you only run vLLM / SGLang / llama.cpp
 PROXY_SOURCE = os.environ.get("PROXY_SOURCE", "")   # force the label of the :11435 proxy (default: detect what answers upstream)
 
 def _default_bind():
@@ -25,9 +26,11 @@ def _default_bind():
     except Exception: pass
     return "127.0.0.1"
 DASH_BIND, DASH_PORT = os.environ.get("DASH_BIND") or _default_bind(), int(os.environ.get("DASH_PORT", 11480))
-# Extra OpenAI-compatible counting proxies (vLLM, llama-server, anything that returns a "usage" field):
-#   OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,llamacpp:8081=127.0.0.1:8080"   (source:listen_port=upstream_host:port)
-# Unset = the defaults above (vLLM on 8001, llama.cpp on 8081), so several runtimes at once just work. Set it empty for none.
+# Extra OpenAI-compatible counting proxies (vLLM, SGLang, llama-server, anything that returns a "usage" field):
+#   OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,sglang:30001=127.0.0.1:30000,llamacpp:8081=127.0.0.1:8080"
+#   (source:listen_port=upstream_host:port)
+# Unset = vLLM on 8001 (-> 8000), SGLang on 30001 (-> 30000), and llama.cpp on 8081 only when no log is being read.
+# Set it empty for none. A listen port that is already taken is skipped with a warning; the rest still start.
 OPENAI_PROXIES = os.environ.get("OPENAI_PROXIES")
 INJECT_USAGE = os.environ.get("INJECT_USAGE", "1") != "0"   # add stream_options.include_usage to streaming /v1 requests
 TRACK = ("/api/generate", "/api/chat", "/v1/chat/completions", "/v1/completions", "/v1/responses", "/api/embed", "/api/embeddings", "/v1/embeddings")
@@ -336,7 +339,7 @@ def parse_usage(endpoint, req_body, tail):
     return model, inp, out, eval_s
 
 def add_usage_opt(path, body):
-    """vLLM / llama-server only report usage on a stream when asked. Ask politely; never break the request."""
+    """vLLM, SGLang and llama-server only report usage on a stream when asked. Ask politely; never break the request."""
     if not INJECT_USAGE or not body or not path.startswith("/v1/") or "embed" in path or path.endswith("/responses"): return body
     try:
         j = json.loads(body)
@@ -433,7 +436,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
 SWAPPABLE = ("vllm", "tensorfold")   # backends that may take turns behind one proxy port; the probe decides which label applies
 
 def probe(host, port):
-    """Who answers at host:port? 'ollama' / 'vllm' / 'tensorfold' / 'llamacpp', 'up' (something else), or None (nothing)."""
+    """Who answers at host:port? 'ollama' / 'vllm' / 'sglang' / 'tensorfold' / 'llamacpp', 'up' (something else), or None (nothing)."""
     hdr = {}
     def get(path):
         c = http.client.HTTPConnection(host, port, timeout=2)
@@ -447,8 +450,10 @@ def probe(host, port):
         except Exception: owners = set()
         # TensorFold (MiaAI-Lab's Zig engine, not a vLLM fork) says so in /v1/models owned_by and in its Server header
         if "tensorfold" in owners or "tensorfold" in hdr.get("server", ""): return "tensorfold"
-        for k in ("vllm", "llamacpp"):
+        for k in ("vllm", "sglang", "llamacpp"):
             if k in owners: return k
+        # SGLang's model list says owned_by "sglang". A Server header is the fallback if a build words that differently.
+        if "sglang" in hdr.get("server", ""): return "sglang"
         return "up"
     except Exception:
         return None
@@ -469,8 +474,8 @@ def check_runtimes():
         if rt["cls"] is not Proxy and kind in SWAPPABLE and rt["src"] in SWAPPABLE and kind != rt["src"]:
             print("upstream %s:%d is now %s (was %s)" % (rt["up"][0], rt["up"][1], SOURCE_LABELS.get(kind, kind), SOURCE_LABELS.get(rt["src"], rt["src"])), flush=True)
             rt["src"] = rt["cls"].SRC = kind
-        # the :11435 proxy is Ollama's by default, but people point it at vLLM too: label by what actually answers
-        if rt["cls"] is Proxy and not PROXY_SOURCE and kind in ("ollama", "vllm", "llamacpp"):
+        # the :11435 proxy is Ollama's by default, but people point it at vLLM or SGLang too: label by what actually answers
+        if rt["cls"] is Proxy and not PROXY_SOURCE and kind in ("ollama", "vllm", "sglang", "llamacpp"):
             Proxy.SRC = rt["src"] = "proxy" if kind == "ollama" else kind
 
 def runtimes_loop():
@@ -486,20 +491,27 @@ def runtimes_info(c):
              "ok": rt.get("ok"), "error": rt.get("error"), "used": used(rt["src"])} for rt in RUNTIMES]
 
 def proxy_specs():
-    """OPENAI_PROXIES if set; otherwise the older build's defaults / VLLM_* / LLAMACPP_* env vars."""
+    """OPENAI_PROXIES if set; otherwise the built-in defaults / VLLM_* / SGLANG_* / LLAMACPP_* env vars."""
     if OPENAI_PROXIES is not None: return OPENAI_PROXIES
     e, out = os.environ.get, []
     if "vllm" in ENGINES:
         out.append("vllm:%s=%s:%s" % (e("VLLM_PROXY_PORT", "8001"), e("VLLM_UPSTREAM_HOST", "127.0.0.1"), e("VLLM_UPSTREAM_PORT", "8000")))
+    if "sglang" in ENGINES:
+        out.append("sglang:%s=%s:%s" % (e("SGLANG_PROXY_PORT", "30001"), e("SGLANG_UPSTREAM_HOST", "127.0.0.1"), e("SGLANG_UPSTREAM_PORT", "30000")))
     if "llamacpp" in ENGINES and not LLAMA_LOG:   # a log path already counts llama.cpp; don't also open :8081
         out.append("llamacpp:%s=%s:%s" % (e("LLAMACPP_PROXY_PORT", "8081"), e("LLAMACPP_UPSTREAM_HOST", "127.0.0.1"), e("LLAMACPP_UPSTREAM_PORT", "8080")))
     return ",".join(out)
 
-LEGACY_ENV = ("ENGINES", "VLLM_PROXY_PORT", "VLLM_UPSTREAM_HOST", "VLLM_UPSTREAM_PORT", "LLAMACPP_PROXY_PORT", "LLAMACPP_UPSTREAM_HOST", "LLAMACPP_UPSTREAM_PORT")
+LEGACY_ENV = ("ENGINES", "VLLM_PROXY_PORT", "VLLM_UPSTREAM_HOST", "VLLM_UPSTREAM_PORT",
+              "SGLANG_PROXY_PORT", "SGLANG_UPSTREAM_HOST", "SGLANG_UPSTREAM_PORT",
+              "LLAMACPP_PROXY_PORT", "LLAMACPP_UPSTREAM_HOST", "LLAMACPP_UPSTREAM_PORT")
 def auto_proxies():
-    """Nothing configured: the vLLM / llama.cpp proxies are only defaults, so wait until the right runtime is detected
-    upstream. Otherwise a default could grab a port someone else uses, or forward (on PROXY_BIND) to an unrelated app on 8000/8080."""
+    """Nothing configured: the vLLM / SGLang / llama.cpp proxies are only defaults, so wait until the right runtime is detected
+    upstream. Otherwise a default could grab a port someone else uses, or forward (on PROXY_BIND) to an unrelated app on 8000/30000/8080."""
     return OPENAI_PROXIES is None and not any(k in os.environ for k in LEGACY_ENV)
+
+# Which knob moves a built-in proxy's listen port. Anything else is an OPENAI_PROXIES name.
+PROXY_PORT_ENV = {"vllm": "VLLM_PROXY_PORT", "sglang": "SGLANG_PROXY_PORT", "llamacpp": "LLAMACPP_PROXY_PORT", "proxy": "PROXY_PORT"}
 
 def start_proxy(cls, src, port, up, auto=False):
     rt = {"src": src, "listen": port, "up": up, "cls": cls, "ok": None, "kind": None, "started": False, "srv": None}
@@ -509,13 +521,19 @@ def start_proxy(cls, src, port, up, auto=False):
 
 def bind_proxy(rt):
     src, port, up = rt["src"], rt["listen"], rt["up"]
+    label = SOURCE_LABELS.get(src, src)
     try: srv = TS((PROXY_BIND, port), rt["cls"])
     except OSError as e:
         rt["error"] = "port %d busy" % port
-        print(f"{SOURCE_LABELS.get(src, src)} proxy NOT started, port {port}: {e}", file=sys.stderr, flush=True); return
+        if src in PROXY_PORT_ENV: how = "Set %s to a free port." % PROXY_PORT_ENV[src]
+        else: how = "Change its listen port in OPENAI_PROXIES."
+        if e.errno == errno.EADDRINUSE: why = "port %d is already in use (%s)" % (port, e)
+        else: why = "port %d could not be opened (%s)" % (port, e)
+        print("warning: %s proxy skipped: %s. The dashboard and the other proxies keep running. %s" % (label, why, how), file=sys.stderr, flush=True)
+        return
     rt["started"], rt["srv"] = True, srv
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"{SOURCE_LABELS.get(src, src)} proxy {PROXY_BIND}:{port} -> {up[0]}:{up[1]}", flush=True)
+    print(f"{label} proxy {PROXY_BIND}:{port} -> {up[0]}:{up[1]}", flush=True)
 
 GIN = re.compile(r'\[GIN\] (\d{4}/\d\d/\d\d - \d\d:\d\d:\d\d) \| (\d+) \|\s+([\d.]+)(ns|µs|us|ms|s|m)?\S* \|\s+(\S+) \| (\w+)\s+"([^"]+)"')
 UNIT = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1, "m": 60, None: 1}
@@ -962,7 +980,7 @@ function renderTrip(){const t=ST.trip;if(!t)return;$('tripTok').textContent=fmt(
  $('tripAvg').textContent=t.ev_s>0?(t.ev_out/t.ev_s).toFixed(1)+' tok/s':'–';
  $('tripSince').textContent='Rampaging since '+when(t.start_ts)+' ('+ago(t.start_ts)+')';
  $('tripHist').innerHTML=ST.trips.map(p=>`<div><span>${esc(p.name||'Unnamed spree')}<span class=muted> · ${new Date(p.start_ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})} to ${new Date(p.end_ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})}</span></span><b style="color:var(--g)">${fmt(p.tin+p.tout)} tok${hero?' · '+money(p.usd):''}</b></div>`).join('')||'<div class=muted>Empty. End a spree to bury it here.</div>'}
-function renderRt(){$('rts').innerHTML=(ST.runtimes||[]).filter(r=>r.ok||r.used&&(r.error||r.ok===false)).map(r=>r.error?`<span class="chip busy" title="${esc(r.error)}">⚠ ${esc(r.label)}: ${esc(r.error)}</span>`
+function renderRt(){$('rts').innerHTML=(ST.runtimes||[]).filter(r=>r.ok||r.error||r.used&&r.ok===false).map(r=>r.error?`<span class="chip busy" title="${esc(r.error)}">⚠ ${esc(r.label)}: ${esc(r.error)}</span>`
   :`<span class="chip${r.ok?'':' down'}" title="clients use :${r.listen}, forwarded to ${esc(r.up)}">${r.ok?'●':'○'} ${esc(r.label)} :${r.listen}${r.ok?'':' (nobody home)'}</span>`).join('')}
 const bigNum=v=>v>=1e9?+(v/1e9).toFixed(1)+' BILLION':v>=1e6?+(v/1e6).toFixed(1)+' MILLION':fmt(v);
 function msName(m){return m.kind=='usd'?'$'+fmt(m.value)+' saved':bigNum(m.value).toLowerCase()+' tokens'}
@@ -1179,7 +1197,7 @@ function updText(u){
  if(u.state=='update_available')return `Current version: ${u.current?'v'+u.current:'unknown'}
 Latest release: v${u.latest}
 
-Install that release? Only this dashboard is updated. Your saved stats stay. Ollama, llama.cpp and vLLM are left alone.`;
+Install that release? Only this dashboard is updated. Your saved stats stay. Ollama, llama.cpp, vLLM and SGLang are left alone.`;
  return u.message||'Could not check for updates.'}
 async function waitBoot(){for(let i=0;i<40;i++){await new Promise(r=>setTimeout(r,1000));try{const s=await(await fetch('api/update',{cache:'no-store'})).json();if(s.boot&&s.boot!==boot0){location.reload();return true}}catch(_){}}return false}
 $('updBtn').onclick=async()=>{
