@@ -100,6 +100,49 @@ On GitHub: Releases → Draft a new release → choose the tag `v1.2.0` → Publ
 
 ## Backend setup
 
+### Counting addresses
+
+The usual way needs no port numbers from you. Leave the dashboard running. Every few seconds it looks at which ports on this machine are open, and asks each one (with a single read of `/v1/models`) whether a model server is there. For each one it finds, it opens a **counting address** on the next free port. vLLM, SGLang, TensorFold, llama.cpp's server, and anything else that answers like them get their own label.
+
+The page says this in yellow, because it is the whole trick: **a program is counted only when it uses the counting address.** Traffic sent straight to the model server is invisible. The counting addresses, with a Copy button, are on the page and in Settings (the gear).
+
+The model server is never restarted, never sent a prompt, and never has its own port taken over.
+
+Ollama is unchanged: it is still counted through port **11435**. llama.cpp is still counted from its log when that log is set, so the same requests are not counted twice.
+
+**Ports that are left alone.** These are never checked and never given a counting address:
+
+- Ollama's own port **11434**, the Ollama counting port **11435**, and the dashboard port (**11480**, or whatever you set)
+- every counting port the dashboard itself opened
+- anything you add
+
+On a machine that also runs some other app, add that app's ports. For example an app on **3000**, and something already using **8001**:
+
+```bash
+PORT_IGNORE=3000,8001 python3 token_annihilator.py
+```
+
+Or type `3000, 8001` into **Ports to leave alone** in Settings and press Save. A port you add there is never probed and never proxied. The same window can turn the search off entirely (uncheck "Look for model servers on this machine"), add a server the search did not notice, or pick the counting port yourself.
+
+If the counting port next to a server is already taken, the dashboard prints a warning, uses the next free port, and keeps running. Nothing else stops.
+
+**The old port variables still work**, if you would rather name them yourself. With the search on, they are used as well as the search. With the search off (`AUTO_DETECT=0`), the dashboard goes back to the fixed ports: vLLM **8001** in front of **8000**, SGLang **30001** in front of **30000**.
+
+```bash
+AUTO_DETECT=0 python3 token_annihilator.py
+VLLM_UPSTREAM_PORT=8010 VLLM_PROXY_PORT=8011 python3 token_annihilator.py
+SGLANG_UPSTREAM_PORT=30000 SGLANG_PROXY_PORT=30011 python3 token_annihilator.py
+OPENAI_PROXIES="vllm:8011=127.0.0.1:8010,sglang:30011=127.0.0.1:30000" python3 token_annihilator.py
+```
+
+`vllm bench serve` still has to use the counting port, and it adds `/v1/completions` itself:
+
+```bash
+vllm bench serve --host 127.0.0.1 --port COUNTING_PORT --model YOUR_MODEL
+```
+
+In an OpenAI-style program the base URL is `http://127.0.0.1:COUNTING_PORT/v1`.
+
 ### Ollama
 
 On by default. Point clients at port **11435** instead of 11434:
@@ -118,7 +161,7 @@ export OLLAMA_HOST=127.0.0.1:11435
 
 ### vLLM
 
-vLLM stays where it is. The usual port is **8000**. The dashboard does not change vLLM. It opens a counting port on **8001** and writes down tokens that pass through that port.
+vLLM stays where it is. The usual port is **8000**. The dashboard does not change vLLM. With the search on, the counting address is the next free port (8001 when 8001 is free) and it is shown on the page. With the search off, it opens **8001**. Either way it writes down tokens that pass through that address.
 
 A request sent straight to 8000 is invisible here. Point the program at 8001.
 
@@ -149,7 +192,7 @@ Swapping vLLM and TensorFold on the same port is fine: the proxy is relabelled t
 
 ### SGLang
 
-Same idea as vLLM. SGLang usually listens on **30000**. The dashboard opens **30001** once SGLang is answering, and the tokens are labelled **SGLang**.
+Same idea as vLLM. SGLang usually listens on **30000**. With the search on, the counting address is the next free port (30001 when 30001 is free). With the search off, it opens **30001** once SGLang is answering. The tokens are labelled **SGLang**.
 
 Point programs at 30001, not 30000. A request sent straight to 30000 is not counted.
 
@@ -220,7 +263,7 @@ Raw Triton KServe (`/v2/models/.../generate`) and in-process ONNX Runtime return
 
 ### Several runtimes at once
 
-The Ollama proxy (11435) starts by default. The vLLM proxy (8001) opens on its own once vLLM answers on 8000. The SGLang proxy (30001) opens on its own once SGLang answers on 30000. The llama.cpp proxy (8081) opens on its own only when the log tail is off (`LLAMA_LOG` empty) and llama-server answers on 8080. An unrelated app on 8000, 30000 or 8080 is never proxied. Setting `OPENAI_PROXIES` replaces those automatic proxies with exactly what you list, started right away with no detection (`OPENAI_PROXIES=` with nothing after it turns them all off). The 11435 proxy labels itself by whatever actually answers there (vLLM, SGLang, llama.cpp, or Ollama). Force it with `PROXY_SOURCE`.
+The Ollama proxy (11435) starts by default. With the search on (the normal setting), a vLLM, SGLang, TensorFold or other OpenAI-compatible server is given a counting port as soon as it is noticed, on the next free port beside it. Turn the search off with `AUTO_DETECT=0` and the older fixed ports come back: vLLM **8001** once vLLM answers on **8000**, SGLang **30001** once SGLang answers on **30000**, and the llama.cpp proxy **8081** only when the log tail is off. An unrelated app is never proxied. Setting `OPENAI_PROXIES` adds exactly the proxies you list (`OPENAI_PROXIES=` with nothing after it adds none). The 11435 proxy labels itself by whatever actually answers there (vLLM, SGLang, llama.cpp, or Ollama). Force it with `PROXY_SOURCE`.
 
 **Ollama, vLLM and SGLang are counted only when the request goes through their counting port.** llama-server on 8080 is counted from its log, with no proxy. Requests sent straight to Ollama on 11434, vLLM on 8000, or SGLang on 30000 still bypass the dashboard.
 
@@ -236,7 +279,10 @@ Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAM
 | `PROXY_BIND` / `PROXY_PORT` | `0.0.0.0` / `11435` | Ollama proxy listen address |
 | `UPSTREAM_HOST` / `UPSTREAM_PORT` | `127.0.0.1` / `11434` | Where Ollama lives |
 | `OLLAMA_PROXY` | `1` | `0` disables the Ollama proxy |
-| `OPENAI_PROXIES` | unset: vLLM `8001` -> `127.0.0.1:8000`, SGLang `30001` -> `127.0.0.1:30000`, and llama.cpp `8081` -> `127.0.0.1:8080` only when `LLAMA_LOG` is empty. Each opens once that runtime is detected | `name:listen_port=host:upstream_port`, comma-separated, started right away. Set empty for none. A busy listen port is skipped |
+| `AUTO_DETECT` | `1` | Look for model servers on this machine and open a counting address beside each one. `0` turns that off and brings back the fixed vLLM / SGLang ports |
+| `PORT_IGNORE` | empty (Ollama `11434`, Ollama counter `11435`, and the dashboard port are always skipped) | Extra ports to never check and never proxy, comma-separated. Example: `3000,8001` |
+| `SCAN_EVERY` | `5` | Seconds between looks. The look is a read of which ports are open, then one short `/v1/models` read on anything new |
+| `OPENAI_PROXIES` | unset while auto-detect is on: none, the search opens them. With `AUTO_DETECT=0`: vLLM `8001` -> `127.0.0.1:8000`, SGLang `30001` -> `127.0.0.1:30000`, and llama.cpp `8081` -> `127.0.0.1:8080` only when `LLAMA_LOG` is empty | `name:listen_port=host:upstream_port`, comma-separated, started right away. Set empty for none. A busy listen port is skipped |
 | `VLLM_PROXY_PORT` | `8001` | Port your programs use for vLLM. Used when `OPENAI_PROXIES` is unset |
 | `VLLM_UPSTREAM_HOST` / `VLLM_UPSTREAM_PORT` | `127.0.0.1` / `8000` | Where vLLM itself is listening |
 | `SGLANG_PROXY_PORT` | `30001` | Port your programs use for SGLang. Used when `OPENAI_PROXIES` is unset |
@@ -274,7 +320,7 @@ Imports past request lines from `journalctl -u ollama`. Those lines have no toke
 python3 test_annihilator.py
 ```
 
-Stdlib only. Spins up fake Ollama, vLLM, SGLang and llama.cpp servers on local ports and checks the counting end to end, including `/v1/completions` traffic like `vllm bench serve` and a counting port that is already taken.
+Stdlib only. Spins up fake Ollama, vLLM, SGLang and llama.cpp servers on local ports and checks the counting end to end, including `/v1/completions` traffic like `vllm bench serve`, a counting port that is already taken, and a search that never touches ports on the leave-alone list.
 
 ## Uninstall
 
