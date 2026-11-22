@@ -13,10 +13,11 @@ Backends supported, each with its own source label:
 | Backend | How it is counted | Label |
 |---|---|---|
 | **Ollama** | Transparent proxy (default `:11435` -> `:11434`) | Ollama |
-| **vLLM** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | vLLM |
+| **vLLM** | Counting proxy. Default `:8001` -> `:8000`. Opens once vLLM answers. Change either port with `VLLM_PROXY_PORT` and `VLLM_UPSTREAM_PORT` | vLLM |
+| **SGLang** | Counting proxy, same idea as vLLM. Default `:30001` -> `:30000`. Opens once SGLang answers. Change either port with `SGLANG_PROXY_PORT` and `SGLANG_UPSTREAM_PORT` | SGLang |
 | **TensorFold** (MiaAI-Lab's Zig engine, OpenAI-compatible) | Same counting proxy as vLLM. Detected from `owned_by: tensorfold` in `/v1/models` or a `Server: TensorFold` header | TensorFold |
 | **llama.cpp** (`llama-server`) | Read-only read of llama-server's log. Default file: `~/pixpilot/run/server.log`. The 8081 proxy is optional and stays off while a log path is set | llama.cpp |
-| **NVIDIA NIM / NeMo, TensorRT-LLM, Triton (OpenAI front end), SGLang, LM Studio** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | NVIDIA NIM, NeMo, TensorRT-LLM, ... |
+| **NVIDIA NIM / NeMo, TensorRT-LLM, Triton (OpenAI front end), LM Studio** | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | NVIDIA NIM, NeMo, TensorRT-LLM, ... |
 | **ONNX Runtime** (Foundry Local, onnxruntime-genai OpenAI servers) | OpenAI-compatible counting proxy (`OPENAI_PROXIES`) | ONNX Runtime |
 
 Anything that speaks `/v1/chat/completions`, `/v1/completions`, `/v1/responses` or `/v1/embeddings` and returns a `usage` field is counted exactly. Run as many runtimes at once as you like; each one gets its own label, leaderboard chip and status chip.
@@ -50,7 +51,7 @@ python3 token_annihilator.py            # try it in the foreground
 
 Open `http://<your-tailscale-ip>:11480` (it binds to your Tailscale IP if `tailscale` is installed, else `127.0.0.1`).
 
-Run it as a systemd user service (no sudo). Edit the `Environment=` lines in the unit file first if you use vLLM, or if llama-server's log is not `~/pixpilot/run/server.log`:
+Run it as a systemd user service (no sudo). Edit the `Environment=` lines in the unit file first if vLLM or SGLang is not on the usual port, or if llama-server's log is not `~/pixpilot/run/server.log`:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -74,7 +75,7 @@ When a newer release exists, the button shows the version you have next to the l
 - keep the previous checkout under `refs/backup/token-annihilator-prev` and put it back if the new files do not match the release
 - restart itself, and only after the new files match the release. If systemd is running it and that service is set to come back (the included unit has `Restart=always`; the service can have any name), the process exits and systemd starts it again. If you started it in a terminal, it reloads itself in place. The page notices, reconnects, and shows the new version. Only if that fails does it ask you to start it again yourself
 
-Your stats database stays. Ollama, llama.cpp, vLLM, their ports, and any other service are not restarted or reconfigured.
+Your stats database stays. Ollama, llama.cpp, vLLM, SGLang, their ports, and any other service are not restarted or reconfigured.
 
 To undo an update that will not start:
 
@@ -117,15 +118,66 @@ export OLLAMA_HOST=127.0.0.1:11435
 
 ### vLLM
 
-Automatic: as soon as vLLM answers on port 8000, a counting proxy opens on **8001** in front of it (checked every 30 s, so vLLM can start after the dashboard). Point your clients at `http://127.0.0.1:8001/v1`. Different ports or host (say vLLM runs across two Sparks with the API on the head node):
+vLLM stays where it is. The usual port is **8000**. The dashboard does not change vLLM. It opens a counting port on **8001** and writes down tokens that pass through that port.
+
+A request sent straight to 8000 is invisible here. Point the program at 8001.
+
+In an OpenAI-style program the base URL is `http://127.0.0.1:8001/v1` (the program adds `/chat/completions` or `/completions` itself).
+
+`vllm bench serve` talks to `/v1/completions`. Point it at the counting port, not at vLLM's own port. It adds `/v1/completions` itself, so do not put `/v1` on the host:
 
 ```bash
-OPENAI_PROXIES="vllm:8001=spark-1:8000" python3 token_annihilator.py
+vllm bench serve --host 127.0.0.1 --port 8001 --model YOUR_MODEL
 ```
+
+Streaming and ordinary (non-streaming) chat and completions both count. The number comes from the `usage` field (`prompt_tokens` and `completion_tokens`). For a stream, the dashboard asks for that field by adding `"stream_options": {"include_usage": true}` when the program did not set `stream_options` itself. `vllm bench serve` already asks. Turn the extra ask off with `INJECT_USAGE=0`. vLLM reports no timings, so for streamed requests the speed (tok/s) is measured from the first to the last streamed chunk.
+
+Different machine or ports (vLLM is on 8010, and 8001 is already taken by something else):
+
+```bash
+VLLM_UPSTREAM_HOST=127.0.0.1 VLLM_UPSTREAM_PORT=8010 VLLM_PROXY_PORT=8011 python3 token_annihilator.py
+vllm bench serve --host 127.0.0.1 --port 8011 --model YOUR_MODEL
+```
+
+`VLLM_UPSTREAM_HOST` is the machine vLLM runs on. `VLLM_UPSTREAM_PORT` is the port vLLM is already using. `VLLM_PROXY_PORT` is the port your programs should use.
+
+Leave the variables unset to keep 8001 and 8000. The counting port opens on its own once vLLM is actually answering (checked every 30 s, so vLLM can start later). A machine that is not running vLLM never takes port 8001.
+
+If the counting port is already taken, the dashboard prints a warning like `vLLM proxy skipped: port 8001 is already in use` and keeps going. The page and every other counter stay up. A yellow chip on the page says the port is busy. Pick a free `VLLM_PROXY_PORT`.
 
 Swapping vLLM and TensorFold on the same port is fine: the proxy is relabelled to whichever one answers (re-checked every 30 s), so each new request is logged under the right name. Old rows keep the label they were logged with. Other engines are never relabelled.
 
-The proxy reads the `usage` field from every response. For streaming requests it automatically adds `"stream_options": {"include_usage": true}` (only when the client did not set `stream_options` itself) so the final chunk carries the token counts. Disable that with `INJECT_USAGE=0`. vLLM reports no timings, so for streamed requests the speed (tok/s) is measured from the first to the last streamed chunk.
+### SGLang
+
+Same idea as vLLM. SGLang usually listens on **30000**. The dashboard opens **30001** once SGLang is answering, and the tokens are labelled **SGLang**.
+
+Point programs at 30001, not 30000. A request sent straight to 30000 is not counted.
+
+OpenAI-style base URL: `http://127.0.0.1:30001/v1`
+
+A completions benchmark, including `vllm bench serve` aimed at SGLang, uses the counting port:
+
+```bash
+vllm bench serve --host 127.0.0.1 --port 30001 --model YOUR_MODEL
+```
+
+Streaming and ordinary `/v1/chat/completions` and `/v1/completions` both count, from the same `usage` field. Streaming requests get the same `include_usage` ask as vLLM.
+
+SGLang on another port, or 30001 already taken:
+
+```bash
+SGLANG_UPSTREAM_HOST=127.0.0.1 SGLANG_UPSTREAM_PORT=30000 SGLANG_PROXY_PORT=30011 python3 token_annihilator.py
+```
+
+Then the base URL is `http://127.0.0.1:30011/v1`.
+
+Leave the variables unset to keep 30001 and 30000. The counting port waits until SGLang answers, so an unused 30001 is left alone. If 30001 is busy when SGLang is detected, that one proxy is skipped with a warning (`Set SGLANG_PROXY_PORT to a free port`) and everything else keeps running.
+
+If the dashboard never notices SGLang, name the ports yourself. This list replaces the automatic vLLM and SGLang ports, so add vLLM back if you use both:
+
+```bash
+OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,sglang:30001=127.0.0.1:30000" python3 token_annihilator.py
+```
 
 ### llama.cpp
 
@@ -148,7 +200,7 @@ To import a log in one shot: `python3 token_annihilator.py --llama-backfill`.
 
 **Counting proxy (optional).** With the log tail on, the automatic proxy on **8081** stays off so the same requests are not counted twice. Set `LLAMA_LOG` empty (and do not set `OPENAI_PROXIES`) to get the old behaviour: a proxy opens on **8081** once llama-server answers on 8080, and clients must use 8081. Don't point clients at 8081 while a log tail of that same server is also on.
 
-Proxy pattern in practice: llama-server stays on **8080** (its start line and any health checks keep using 8080), and only the clients that send prompts move to **8081**, for example `--base-url http://127.0.0.1:8081/v1`. Streaming passes straight through (about one token per chunk), and the proxy adds only a few percent to total request time. If you want the proxy fixed instead of auto-detected, list it yourself (optional; this replaces the automatic vLLM proxy too, so add `vllm:8001=127.0.0.1:8000` to the list if you also run vLLM):
+Proxy pattern in practice: llama-server stays on **8080** (its start line and any health checks keep using 8080), and only the clients that send prompts move to **8081**, for example `--base-url http://127.0.0.1:8081/v1`. Streaming passes straight through (about one token per chunk), and the proxy adds only a few percent to total request time. If you want the proxy fixed instead of auto-detected, list it yourself (optional; this replaces the automatic vLLM and SGLang proxies too, so add those to the list if you also run them):
 
 ```bash
 OPENAI_PROXIES="llamacpp:8081=127.0.0.1:8080" python3 token_annihilator.py
@@ -158,21 +210,23 @@ The proxy ports are API passthroughs, not the dashboard. Opening `/` on 8081 sho
 
 ### NVIDIA NIM / NeMo, ONNX Runtime and other OpenAI-compatible servers
 
-Give each one a name and a port in `OPENAI_PROXIES`. Known names get a pretty label (`nim`, `nemo`, `trtllm`, `triton`, `onnx`, `sglang`, `lmstudio`, `openai`); any other name is shown as written.
+Give each one a name and a port in `OPENAI_PROXIES`. Known names get a pretty label (`vllm`, `sglang`, `nim`, `nemo`, `trtllm`, `triton`, `onnx`, `lmstudio`, `openai`); any other name is shown as written.
 
 ```bash
-OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,nim:8002=127.0.0.1:9000,onnx:8003=127.0.0.1:5273" python3 token_annihilator.py
+OPENAI_PROXIES="vllm:8001=127.0.0.1:8000,sglang:30001=127.0.0.1:30000,nim:8002=127.0.0.1:9000,onnx:8003=127.0.0.1:5273" python3 token_annihilator.py
 ```
 
 Raw Triton KServe (`/v2/models/.../generate`) and in-process ONNX Runtime return no token counts, so they can't be counted. Put Triton's OpenAI front end or an OpenAI-compatible ONNX server in front.
 
 ### Several runtimes at once
 
-The Ollama proxy (11435) starts by default. The vLLM proxy (8001) opens on its own once vLLM answers on 8000. The llama.cpp proxy (8081) opens on its own only when the log tail is off (`LLAMA_LOG` empty) and llama-server answers on 8080. An unrelated app on 8000 or 8080 is never proxied. Setting `OPENAI_PROXIES` replaces those automatic proxies with exactly what you list, started right away with no detection (`OPENAI_PROXIES=` with nothing after it turns them all off). The 11435 proxy labels itself by whatever actually answers upstream (if you point `UPSTREAM_PORT` at vLLM it says vLLM, not Ollama); force it with `PROXY_SOURCE`.
+The Ollama proxy (11435) starts by default. The vLLM proxy (8001) opens on its own once vLLM answers on 8000. The SGLang proxy (30001) opens on its own once SGLang answers on 30000. The llama.cpp proxy (8081) opens on its own only when the log tail is off (`LLAMA_LOG` empty) and llama-server answers on 8080. An unrelated app on 8000, 30000 or 8080 is never proxied. Setting `OPENAI_PROXIES` replaces those automatic proxies with exactly what you list, started right away with no detection (`OPENAI_PROXIES=` with nothing after it turns them all off). The 11435 proxy labels itself by whatever actually answers there (vLLM, SGLang, llama.cpp, or Ollama). Force it with `PROXY_SOURCE`.
 
-**Ollama and vLLM are counted only when the request goes through their proxy.** llama-server on 8080 is counted from its log, with no proxy. Requests sent straight to Ollama on 11434 or vLLM on 8000 still bypass the dashboard.
+**Ollama, vLLM and SGLang are counted only when the request goes through their counting port.** llama-server on 8080 is counted from its log, with no proxy. Requests sent straight to Ollama on 11434, vLLM on 8000, or SGLang on 30000 still bypass the dashboard.
 
-Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAMACPP_*` settings still work, and rows it saved are relabelled from Ollama to their real runtime the first time this version starts.
+A counting port that is already taken does not stop the dashboard. That one proxy is skipped, a warning is printed, and the others start as usual.
+
+Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAMACPP_*` settings still work, and rows it saved are relabelled from Ollama to their real runtime the first time this version starts. SGLang is on by default now. An `ENGINES` list you set yourself is used as written, so add `sglang` to that list if you want the automatic SGLang port.
 
 ## Configuration
 
@@ -182,10 +236,14 @@ Upgrading from the earlier multi-engine build? Its `ENGINES`, `VLLM_*` and `LLAM
 | `PROXY_BIND` / `PROXY_PORT` | `0.0.0.0` / `11435` | Ollama proxy listen address |
 | `UPSTREAM_HOST` / `UPSTREAM_PORT` | `127.0.0.1` / `11434` | Where Ollama lives |
 | `OLLAMA_PROXY` | `1` | `0` disables the Ollama proxy |
-| `OPENAI_PROXIES` | unset: vLLM `8001` -> `127.0.0.1:8000`, and llama.cpp `8081` -> `127.0.0.1:8080` only when `LLAMA_LOG` is empty. Each opens once that runtime is detected | `source:listen_port=upstream_host:port`, comma-separated, started right away. Set empty for none |
-| `PROXY_SOURCE` | detected | Force the label of the 11435 proxy (`ollama`, `vllm`, ...) |
-| `ENGINES` | `ollama,vllm,llamacpp` | Older-build switch; used only when `OPENAI_PROXIES` is unset |
-| `INJECT_USAGE` | `1` | Ask streaming `/v1` requests to include usage |
+| `OPENAI_PROXIES` | unset: vLLM `8001` -> `127.0.0.1:8000`, SGLang `30001` -> `127.0.0.1:30000`, and llama.cpp `8081` -> `127.0.0.1:8080` only when `LLAMA_LOG` is empty. Each opens once that runtime is detected | `name:listen_port=host:upstream_port`, comma-separated, started right away. Set empty for none. A busy listen port is skipped |
+| `VLLM_PROXY_PORT` | `8001` | Port your programs use for vLLM. Used when `OPENAI_PROXIES` is unset |
+| `VLLM_UPSTREAM_HOST` / `VLLM_UPSTREAM_PORT` | `127.0.0.1` / `8000` | Where vLLM itself is listening |
+| `SGLANG_PROXY_PORT` | `30001` | Port your programs use for SGLang. Used when `OPENAI_PROXIES` is unset |
+| `SGLANG_UPSTREAM_HOST` / `SGLANG_UPSTREAM_PORT` | `127.0.0.1` / `30000` | Where SGLang itself is listening |
+| `PROXY_SOURCE` | detected | Force the label of the 11435 proxy (`ollama`, `vllm`, `sglang`, ...) |
+| `ENGINES` | `ollama,vllm,sglang,llamacpp` | Older-build switch; used only when `OPENAI_PROXIES` is unset. Setting this, or any `VLLM_*` / `SGLANG_*` / `LLAMACPP_*` port, opens the automatic counting ports right away instead of waiting for the server |
+| `INJECT_USAGE` | `1` | Ask streaming `/v1` chat, completions and other `/v1` requests (except embeddings and `/v1/responses`) to include usage |
 | `LLAMA_LOG` | `~/pixpilot/run/server.log` | llama-server log to read. Empty turns the tail off and brings back the automatic 8081 proxy. A missing file is fine |
 | `LLAMA_POLL_S` | `15` | Seconds between reads once caught up |
 | `LLAMA_READ_MAX` | `2000000` | Max new log bytes read per pass, so a big file cannot stall the page |
@@ -216,7 +274,7 @@ Imports past request lines from `journalctl -u ollama`. Those lines have no toke
 python3 test_annihilator.py
 ```
 
-Stdlib only. Spins up fake Ollama, vLLM and llama.cpp servers on local ports and checks the counting end to end.
+Stdlib only. Spins up fake Ollama, vLLM, SGLang and llama.cpp servers on local ports and checks the counting end to end, including `/v1/completions` traffic like `vllm bench serve` and a counting port that is already taken.
 
 ## Uninstall
 
