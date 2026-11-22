@@ -8,7 +8,14 @@ After=network-online.target
 WorkingDirectory=%h/token-annihilation-dashboard
 # Uncomment and edit what you use (see README):
 # Ollama :11435 runs by default.
-# vLLM :8001 opens once vLLM answers on 8000. SGLang :30001 opens once SGLang answers on 30000.
+# The dashboard looks on this machine for vLLM, SGLang and the other OpenAI-compatible servers
+# and opens a counting address on the next free port. Programs must use that address.
+# Ollama's port, the dashboard port, and every counting port are never checked.
+# Add any other app you do not want touched (AUC on 3000, or something already using 8001):
+# Environment=PORT_IGNORE=3000,8001
+# Environment=AUTO_DETECT=0
+# vLLM :8001 opens once vLLM answers on 8000, and SGLang :30001 once SGLang answers on 30000,
+# only when AUTO_DETECT=0 (or when you set the port variables below).
 # If that counting port is already taken, that one proxy is skipped with a warning. The page and the others keep running.
 # vLLM on 8010, and 8001 already taken, so programs use 8011:
 # Environment=VLLM_UPSTREAM_PORT=8010

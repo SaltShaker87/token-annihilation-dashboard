@@ -374,7 +374,8 @@ class ProxyTests(unittest.TestCase):
             threading.Thread(target=s.serve_forever, daemon=True).start(); cls.servers[k] = s
         env = dict(os.environ, STATS_DB=cls.db, DASH_BIND="127.0.0.1", DASH_PORT=str(cls.dash), PROXY_BIND="127.0.0.1",
                    PROXY_PORT=str(cls.px["ollama"]), UPSTREAM_HOST="127.0.0.1", UPSTREAM_PORT=str(cls.up["ollama"]), LLAMA_LOG="",
-                   OPENAI_PROXIES="vllm:%d=127.0.0.1:%d,llamacpp:%d=127.0.0.1:%d" % (cls.px["vllm"], cls.up["vllm"], cls.px["llamacpp"], cls.up["llamacpp"]))
+                   OPENAI_PROXIES="vllm:%d=127.0.0.1:%d,llamacpp:%d=127.0.0.1:%d" % (cls.px["vllm"], cls.up["vllm"], cls.px["llamacpp"], cls.up["llamacpp"]),
+                   AUTO_DETECT="0")
         cls.proc = subprocess.Popen([sys.executable, os.path.join(HERE, "token_annihilator.py")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         cls.boot = ""; deadline = time.time() + 8
         while time.time() < deadline and "Ollama proxy" not in cls.boot: cls.boot += cls.proc.stdout.readline()
@@ -1242,7 +1243,7 @@ class RestartEndToEndTests(unittest.TestCase):
             env = os.environ.copy()
             env.update(DASH_BIND="127.0.0.1", DASH_PORT=str(dash), PROXY_BIND="127.0.0.1", PROXY_PORT=str(proxy),
                        OLLAMA_PROXY="1", OPENAI_PROXIES="", LLAMA_LOG="", STATS_DB=os.path.join(inst, "stats.db"),
-                       PYTHONDONTWRITEBYTECODE="1")
+                       PYTHONDONTWRITEBYTECODE="1", AUTO_DETECT="0")
             env.pop("INVOCATION_ID", None)   # this is a hand start, so the process must reload itself
             proc = subprocess.Popen([sys.executable, os.path.join(inst, "token_annihilator.py")], cwd=inst, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -1541,7 +1542,7 @@ class VllmSglangTests(unittest.TestCase):
         sg.seen = []; sg.gets = {"/v1/models": '{"object":"list","data":[{"id":"Inkling-2-Mini","owned_by":"sglang"}]}'}
         threading.Thread(target=sg.serve_forever, daemon=True).start(); self.servers.append(sg)
         db = os.path.join(self.tmp, "dash.db")
-        env = dict(os.environ, STATS_DB=db, DASH_BIND="127.0.0.1", DASH_PORT=str(dash), PROXY_BIND="127.0.0.1",
+        env = dict(os.environ, STATS_DB=db, DASH_BIND="127.0.0.1", DASH_PORT=str(dash), PROXY_BIND="127.0.0.1", AUTO_DETECT="0",
                    PROXY_PORT=str(opx), UPSTREAM_HOST="127.0.0.1", UPSTREAM_PORT=str(up_ol),
                    OLLAMA_PROXY="1", LLAMA_LOG="",
                    OPENAI_PROXIES="vllm:%d=127.0.0.1:9,sglang:%d=127.0.0.1:%d" % (busy, spx, up_sg))
@@ -1611,7 +1612,7 @@ class SettingsApiTests(unittest.TestCase):
     PORT = 18195
 
     def start(self, **env):
-        e = dict(os.environ, STATS_DB=self.db, DASH_BIND="127.0.0.1", DASH_PORT=str(self.PORT), PROXY_BIND="127.0.0.1", OLLAMA_PROXY="0", OPENAI_PROXIES="", LLAMA_LOG="")
+        e = dict(os.environ, STATS_DB=self.db, DASH_BIND="127.0.0.1", DASH_PORT=str(self.PORT), PROXY_BIND="127.0.0.1", OLLAMA_PROXY="0", OPENAI_PROXIES="", LLAMA_LOG="", AUTO_DETECT="0")
         for k in [k for k in e if k.startswith("MS_")]: del e[k]
         e.update(env)
         self.proc = subprocess.Popen([sys.executable, os.path.join(HERE, "token_annihilator.py")], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -1730,6 +1731,200 @@ class FailedRequestTests(unittest.TestCase):
                 self.assertEqual(j["rng"]["nreq"], 2); self.assertEqual({s["src"] for s in j["sources"]}, {"vllm", "bolt"})
             self.assertEqual(sqlite3.connect(ta.DB).execute("SELECT COUNT(*) FROM requests").fetchone()[0], 5)   # nothing deleted
         finally: ta.DB, ta.TOT[0], ta.TOT[1] = saved
+
+
+class PortDetectTests(unittest.TestCase):
+    """Local servers are found with one read-only GET. Excluded ports are never contacted, and the server's own port is never taken."""
+
+    def setUp(self):
+        self.saved = (ta.DB, dict(ta.PORT_SAVED), list(ta.RUNTIMES), ta.PROXY_BIND, ta.OPENAI_PROXIES, list(ta.ENGINES),
+                      ta.LLAMA_LOG, ta.probe_models, dict(ta._NEG), list(ta.LOG_ONLY), dict(os.environ), ta.DASH_PORT, ta.UP_PORT, ta.PROXY_PORT,
+                      dict(ta.MS_SAVED), tuple(ta.TOT))
+        ta.PORT_SAVED.clear(); ta.RUNTIMES[:] = []; ta.LOG_ONLY[:] = []; ta._NEG.clear()
+        ta.PROXY_BIND = "127.0.0.1"
+        self.servers = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for s in self.servers:
+            try: s.shutdown(); s.server_close()
+            except Exception: pass
+        for rt in list(ta.RUNTIMES):
+            ta.stop_runtime(rt)
+        db, saved, rts, bind, proxies, engines, log, probe, neg, notes, env, dash, up, px, ms, tot = self.saved
+        ta.DB = db; ta.PORT_SAVED.clear(); ta.PORT_SAVED.update(saved); ta.RUNTIMES[:] = rts
+        ta.PROXY_BIND = bind; ta.OPENAI_PROXIES = proxies; ta.ENGINES[:] = engines; ta.LLAMA_LOG = log
+        ta.probe_models = probe; ta._NEG.clear(); ta._NEG.update(neg); ta.LOG_ONLY[:] = notes
+        ta.DASH_PORT, ta.UP_PORT, ta.PROXY_PORT = dash, up, px
+        ta.MS_SAVED.clear(); ta.MS_SAVED.update(ms); ta.TOT[0], ta.TOT[1] = tot; ta.ms_apply()
+        os.environ.clear(); os.environ.update(env)
+
+    def _models(self, owned):
+        s = Server(("127.0.0.1", 0), Handler); s.queue = {}; s.seen = []
+        s.gets = {"/v1/models": json.dumps({"object": "list", "data": [{"id": "m", "owned_by": owned}]})}
+        threading.Thread(target=s.serve_forever, daemon=True).start(); self.servers.append(s)
+        return s
+
+    def test_listener_table_keeps_only_local_listen_ports(self):
+        text = "\n".join([
+            "  sl  local_address rem_address   st",
+            "   0: 0100007F:2CAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1 1 0 0 0 0",  # 127.0.0.1:11434 LISTEN
+            "   1: 00000000:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1 1 0 0 0 0",  # 0.0.0.0:8000 LISTEN
+            "   2: 08080808:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1 1 0 0 0 0",  # 8.8.8.8:80 LISTEN, not ours
+            "   3: 0100007F:1F41 00000000:0000 01 00000000:00000000 00:00000000 00000000 0 0 1 1 0 0 0 0",  # 127.0.0.1:8001 established, not listen
+        ]) + "\n"
+        self.assertEqual(ta.listening_local_ports(text), {11434, 8000})
+
+    def test_models_list_names_the_server_and_ignores_other_answers(self):
+        sg = self._models("sglang"); self.assertEqual(ta.probe_models("127.0.0.1", sg.server_address[1]), "sglang")
+        self.assertEqual(sg.seen, [])   # the check is a GET, never a prompt
+        vl = self._models("vllm"); self.assertEqual(ta.probe_models("127.0.0.1", vl.server_address[1]), "vllm")
+        tf = self._models("tensorfold"); self.assertEqual(ta.probe_models("127.0.0.1", tf.server_address[1]), "tensorfold")
+        lc = self._models("llamacpp"); self.assertEqual(ta.probe_models("127.0.0.1", lc.server_address[1]), "llamacpp")
+        other = self._models("someone"); self.assertEqual(ta.probe_models("127.0.0.1", other.server_address[1]), "openai")
+        dead = _free_port(); self.assertIsNone(ta.probe_models("127.0.0.1", dead, timeout=0.2))
+
+    def test_default_ignore_covers_ollama_and_the_dashboard(self):
+        ta.PORT_SAVED.clear()
+        os.environ.pop("PORT_IGNORE", None)
+        self.assertTrue({11434, 11435, 11480, ta.DASH_PORT, ta.PROXY_PORT, ta.UP_PORT} <= ta.configured_ignore())
+        os.environ["PORT_IGNORE"] = "3000, 8001"
+        self.assertTrue({3000, 8001, 11434, ta.DASH_PORT} <= ta.configured_ignore())
+
+    def test_excluded_ports_are_never_contacted(self):
+        ta.PORT_SAVED.update({"auto": True, "ignore": [3000, 8001, 11434, 11480], "manual": [], "listen": {}})
+        calls = []
+        ta.probe_models = lambda h, p: calls.append(p) or None
+        ta.scan_once(ports={3000, 8001, 11434, 11435, ta.DASH_PORT, 11480, 25111})
+        self.assertEqual(calls, [25111])   # the only port that is allowed to be asked
+        ta.PORT_SAVED["ignore"] = [9]   # the dashboard port was taken off the edited list
+        calls.clear()
+        ta.scan_once(ports={ta.DASH_PORT, 11434, 25112})
+        self.assertNotIn(ta.DASH_PORT, calls)
+        self.assertNotIn(11434, calls)   # Ollama's port stays out because it is this program's upstream
+        self.assertIn(25112, calls)
+
+    def test_a_found_server_gets_the_next_free_port_not_its_own(self):
+        sg = self._models("sglang")
+        up = sg.server_address[1]
+        held = socket.socket(); held.bind(("127.0.0.1", up + 1)); held.listen(1); self.addCleanup(held.close)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ta.scan_once(ports={up})
+        rt = ta._proxy_for("127.0.0.1", up)
+        self.assertIsNotNone(rt); self.assertTrue(rt["started"]); self.assertEqual(rt["src"], "sglang")
+        self.assertNotEqual(rt["listen"], up)
+        self.assertEqual(rt["listen"], up + 2)
+        self.assertIn("already in use", err.getvalue())
+        self.assertIn("keeps running", err.getvalue())
+        sg.queue["/v1/chat/completions"] = ['{"model":"Inkling-2-Mini","usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}']
+        ta.DB = os.path.join(tempfile.mkdtemp(prefix="count-"), "s.db"); ta.init_db()
+        st, _ = req(rt["listen"], "POST", "/v1/chat/completions", {"model": "Inkling-2-Mini", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(st, 200)
+
+    def test_ollama_and_a_logged_llama_server_are_not_proxied_again(self):
+        ta.probe_models = lambda h, p: "ollama"
+        ta.scan_once(ports={25221})
+        self.assertFalse(any(rt.get("up") == ("127.0.0.1", 25221) for rt in ta.RUNTIMES))
+        self.assertEqual(ta.LOG_ONLY[0]["how"], "ollama")
+        ta.LLAMA_LOG = "/tmp/llama.log"
+        ta.probe_models = lambda h, p: "llamacpp"
+        ta.scan_once(ports={25222})
+        self.assertFalse(any(rt.get("up") == ("127.0.0.1", 25222) for rt in ta.RUNTIMES))
+        self.assertEqual(ta.LOG_ONLY[0]["how"], "log")
+
+    def test_auto_detect_off_and_explicit_ports_still_work(self):
+        calls = []
+        ta.probe_models = lambda h, p: calls.append(p) or "vllm"
+        os.environ["AUTO_DETECT"] = "0"
+        self.assertEqual(ta.scan_once(ports={25333}), [])
+        self.assertEqual(calls, [])
+        ta.OPENAI_PROXIES = None
+        ta.ENGINES[:] = ["ollama", "vllm", "sglang", "llamacpp"]
+        ta.LLAMA_LOG = "/tmp/llama.log"
+        for k in list(ta.LEGACY_ENV): os.environ.pop(k, None)
+        os.environ.pop("AUTO_DETECT", None)
+        self.assertTrue(ta.auto_detect_on()); self.assertEqual(ta.startup_specs(), "")
+        os.environ["AUTO_DETECT"] = "0"
+        self.assertEqual(ta.startup_specs(), "vllm:8001=127.0.0.1:8000,sglang:30001=127.0.0.1:30000")
+        os.environ["AUTO_DETECT"] = "1"
+        os.environ["VLLM_UPSTREAM_PORT"] = "8010"; os.environ["VLLM_PROXY_PORT"] = "8011"
+        self.assertEqual(ta.explicit_proxy_specs(), "vllm:8011=127.0.0.1:8010")
+
+    def test_port_settings_are_validated_and_saved(self):
+        tmp = tempfile.mkdtemp(prefix="ports-"); old = ta.DB
+        ta.DB = os.path.join(tmp, "s.db"); ta.init_db()
+        bad, _ = ta.validate_ports({"auto": "yes", "ignore": [0], "manual": [{"name": "VLLM", "host": "http://nope", "port": 3000}], "listen": {"5": 5}})
+        self.assertTrue(bad)
+        st, j = ta.settings_save({"ports": {"auto": False, "ignore": [3000, 8001, 11434], "manual": [], "listen": {}}})
+        self.assertEqual(st, 200, j)
+        self.assertFalse(j["ports"]["auto"]); self.assertEqual(j["ports"]["ignore"], [3000, 8001, 11434])
+        st, j = ta.settings_save({"ports": {"auto": True, "ignore": [3000], "manual": [{"name": "vllm", "host": "127.0.0.1", "port": 3000}], "listen": {}}})
+        self.assertEqual(st, 400); self.assertIn("manual", j["errors"])
+        st, j = ta.settings_save({"ports": {"auto": True, "ignore": [3000, 8001], "manual": [{"name": "sglang", "host": "127.0.0.1", "port": 31000, "listen": 31000}], "listen": {}}})
+        self.assertEqual(st, 400)
+        st, j = ta.settings_save({"settings": {"preview": 4}})   # milestones alone still save
+        self.assertEqual(st, 200); self.assertEqual(j["settings"]["preview"], 4)
+        self.assertEqual(j["ports"]["ignore"], [3000, 8001, 11434])   # the earlier port save is still there
+        ta.DB = old
+
+    def test_live_scan_counts_and_leaves_excluded_ports_alone(self):
+        traps, hits, stop = [], [], threading.Event()
+        for port in (3000, 8001, 11434):
+            s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try: s.bind(("127.0.0.1", port))
+            except OSError: s.close(); continue
+            s.listen(8); s.settimeout(0.2); traps.append(s)
+            def run(sock=s, p=port):
+                while not stop.is_set():
+                    try:
+                        c, _ = sock.accept(); hits.append(p); c.close()
+                    except socket.timeout: pass
+                    except OSError: break
+            threading.Thread(target=run, daemon=True).start()
+        self.addCleanup(stop.set)
+        for s in traps: self.addCleanup(s.close)
+        sg = self._models("SGLang")
+        up = sg.server_address[1]
+        sg.queue["/v1/completions"] = ['{"model":"Inkling-2-Mini","usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}']
+        dash = _free_port(); db = os.path.join(tempfile.mkdtemp(prefix="scan-"), "s.db")
+        env = dict(os.environ, STATS_DB=db, DASH_BIND="127.0.0.1", DASH_PORT=str(dash), PROXY_BIND="127.0.0.1",
+                   OLLAMA_PROXY="0", OPENAI_PROXIES="", LLAMA_LOG="", AUTO_DETECT="1", PORT_IGNORE="3000,8001")
+        proc = subprocess.Popen([sys.executable, os.path.join(HERE, "token_annihilator.py")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        boot = []
+        def drain():
+            for line in proc.stdout: boot.append(line)
+        threading.Thread(target=drain, daemon=True).start()
+        def stop_proc():
+            if proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=3)
+                except subprocess.TimeoutExpired: proc.kill()
+            try: proc.stdout.close()
+            except Exception: pass
+        self.addCleanup(stop_proc)
+        found = None; deadline = time.time() + 20
+        while time.time() < deadline and not found:
+            try:
+                j = json.loads(req(dash, "GET", "/api/settings")[1])
+                for row in j["ports"]["servers"]:
+                    if row.get("src") == "sglang" and row.get("counting"): found = row; break
+            except Exception: pass
+            time.sleep(0.3)
+        self.assertIsNotNone(found, "".join(boot))
+        self.assertNotEqual(found["upstream_port"], int(found["counting"].rsplit(":", 1)[1].split("/")[0]))
+        port = int(found["counting"].rsplit(":", 1)[1].split("/")[0])
+        self.assertEqual(req(port, "POST", "/v1/completions", {"model": "Inkling-2-Mini", "prompt": "hi"})[0], 200)
+        rows = []; deadline = time.time() + 3
+        while time.time() < deadline and not rows:
+            rows = sqlite3.connect(db).execute("SELECT source, model, input_tokens, output_tokens FROM requests").fetchall(); time.sleep(0.05)
+        self.assertEqual(rows, [("sglang", "Inkling-2-Mini", 9, 3)])
+        page = req(dash, "GET", "/")[1].decode()
+        self.assertIn("Counted only at the counting address", page)
+        self.assertIn("Ports to leave alone", page)
+        self.assertIn("data-copy", page)
+        self.assertEqual(hits, [])   # 3000, 8001 and Ollama's 11434 were never opened
+        stop.set()
 
 
 if __name__ == "__main__":

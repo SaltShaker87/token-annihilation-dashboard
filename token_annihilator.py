@@ -2,7 +2,7 @@
 """Token Annihilation Dashboard: transparent token-counting proxies (Ollama, vLLM, SGLang, llama.cpp / any
 OpenAI-compatible server) + llama.cpp log tailing + a tiny, gloriously dramatic dashboard. Stdlib only.
 MIT licensed. https://github.com/SaltShaker87/token-annihilation-dashboard"""
-import ast, errno, fcntl, http.client, http.server, json, os, re, sqlite3, stat, subprocess, sys, threading, time, html, urllib.error, urllib.request
+import ast, errno, fcntl, http.client, http.server, json, os, re, socket, sqlite3, stat, subprocess, sys, threading, time, html, urllib.error, urllib.request
 from datetime import datetime
 from socketserver import ThreadingMixIn
 
@@ -77,6 +77,7 @@ def init_db():
         c.execute("INSERT INTO trips(name,start_ts) VALUES(NULL,?)", (first or time.time(),))
     TOT[0], TOT[1] = c.execute(f"SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0) FROM requests WHERE {V}").fetchone()
     ms_load_saved(c)
+    port_load_saved(c)
     check_ms(c); c.commit(); c.close()
 
 def hero_price():
@@ -261,17 +262,22 @@ def ms_backfill_seen(c):
 def settings_payload():
     base = ms_baseline(); eff = ms_effective()
     src = {k: "ui" if k in MS_SAVED else "env" if k in MS_ENV else "default" for k in MS_DEFAULTS}
-    return {"ok": True, "settings": eff, "baseline": base, "defaults": MS_DEFAULTS, "sources": src, "env": {k: MS_ENV_NAMES[k] for k in MS_ENV}}
+    return {"ok": True, "settings": eff, "baseline": base, "defaults": MS_DEFAULTS, "sources": src, "env": {k: MS_ENV_NAMES[k] for k in MS_ENV},
+            "ports": ports_public()}
 
 def settings_save(body):
-    """POST /api/settings: {"settings": {...}} saves (and applies) the given settings, {"reset": true} clears the saved ones.
-    Returns (http_status, payload)."""
-    if body.get("reset") is True:
-        new = {}
-    else:
+    """POST /api/settings. {"settings": {...}} saves milestones, {"ports": {...}} saves the port list,
+    {"reset": true} clears both. Returns (http_status, payload)."""
+    if not isinstance(body, dict): body = {}
+    resetting = body.get("reset") is True
+    has_ms, has_ports = "settings" in body, "ports" in body
+    if not resetting and not has_ms and not has_ports:
+        return 400, {"ok": False, "errors": {"settings": "send {\"settings\": {...}} or {\"reset\": true}"}}
+    new, port_clean = {}, None
+    if has_ms and not resetting:
         incoming = body.get("settings")
         if not isinstance(incoming, dict) or not incoming: return 400, {"ok": False, "errors": {"settings": "send {\"settings\": {...}} or {\"reset\": true}"}}
-        errors, new = {}, {}
+        errors = {}
         for k, v in incoming.items():
             if k not in MS_CHECKS: errors[k] = "unknown setting"; continue
             try: new[k] = MS_CHECKS[k](v)
@@ -284,15 +290,28 @@ def settings_save(body):
             except ValueError: n = MS_MAX_COUNT + 1
             if n > MS_MAX_COUNT: errors[kind + "_tiers"] = "that would make more than %d milestones at your current totals; use bigger steps" % MS_MAX_COUNT
         if errors: return 400, {"ok": False, "errors": errors}
+    if has_ports and not resetting:
+        err, port_clean = validate_ports(body.get("ports"))
+        if err: return 400, {"ok": False, "errors": err}
     with lock:
         c = db()
         try:
-            merged = {} if body.get("reset") is True else {**MS_SAVED, **new}
-            if merged: c.execute("INSERT INTO settings(key,value) VALUES('milestones',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps({k: merged[k] for k in merged}),))
-            else: c.execute("DELETE FROM settings WHERE key='milestones'")
-            MS_SAVED.clear(); MS_SAVED.update(merged); ms_apply()
+            if resetting:
+                c.execute("DELETE FROM settings WHERE key IN ('milestones','ports')")
+                MS_SAVED.clear(); ms_apply(); PORT_SAVED.clear()
+            else:
+                if has_ms:
+                    merged = {**MS_SAVED, **new}
+                    if merged: c.execute("INSERT INTO settings(key,value) VALUES('milestones',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps({k: merged[k] for k in merged}),))
+                    else: c.execute("DELETE FROM settings WHERE key='milestones'")
+                    MS_SAVED.clear(); MS_SAVED.update(merged); ms_apply()
+                if port_clean is not None:
+                    c.execute("INSERT INTO settings(key,value) VALUES('ports',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(port_clean),))
+                    PORT_SAVED.clear(); PORT_SAVED.update(port_clean)
             ms_backfill_seen(c); c.commit()
         finally: c.close()
+    try: apply_port_config()
+    except Exception as e: print("port apply error:", e, file=sys.stderr, flush=True)
     return 200, settings_payload()
 
 def log_row(**r):
@@ -459,7 +478,7 @@ def probe(host, port):
         return None
 
 def check_runtimes():
-    for rt in RUNTIMES:
+    for rt in list(RUNTIMES):
         if rt.get("error"): continue
         kind = probe(*rt["up"])
         if not rt["started"]:   # a default proxy claims its port only once the right runtime answers upstream
@@ -488,7 +507,8 @@ def runtimes_info(c):
     """`used`: it has counted tokens before, so it being down is news (an unused default proxy being down is not)."""
     used = lambda s: bool(c.execute("SELECT 1 FROM requests WHERE source=? LIMIT 1", (s,)).fetchone())
     return [{"label": SOURCE_LABELS.get(rt["src"], rt["src"]), "listen": rt["listen"], "up": "%s:%d" % rt["up"],
-             "ok": rt.get("ok"), "error": rt.get("error"), "used": used(rt["src"])} for rt in RUNTIMES]
+             "ok": rt.get("ok"), "error": rt.get("error"), "used": used(rt["src"]), "how": rt.get("how") or "",
+             "counting": counting_url(rt["listen"]) if rt.get("started") else None} for rt in RUNTIMES]
 
 def proxy_specs():
     """OPENAI_PROXIES if set; otherwise the built-in defaults / VLLM_* / SGLANG_* / LLAMACPP_* env vars."""
@@ -513,8 +533,8 @@ def auto_proxies():
 # Which knob moves a built-in proxy's listen port. Anything else is an OPENAI_PROXIES name.
 PROXY_PORT_ENV = {"vllm": "VLLM_PROXY_PORT", "sglang": "SGLANG_PROXY_PORT", "llamacpp": "LLAMACPP_PROXY_PORT", "proxy": "PROXY_PORT"}
 
-def start_proxy(cls, src, port, up, auto=False):
-    rt = {"src": src, "listen": port, "up": up, "cls": cls, "ok": None, "kind": None, "started": False, "srv": None}
+def start_proxy(cls, src, port, up, auto=False, how="env"):
+    rt = {"src": src, "listen": port, "up": up, "cls": cls, "ok": None, "kind": None, "started": False, "srv": None, "how": how}
     RUNTIMES.append(rt)
     if auto: print(f"{SOURCE_LABELS.get(src, src)} proxy {PROXY_BIND}:{port} starts once {SOURCE_LABELS.get(src, src)} answers at {up[0]}:{up[1]}", flush=True)
     else: bind_proxy(rt)
@@ -534,6 +554,357 @@ def bind_proxy(rt):
     rt["started"], rt["srv"] = True, srv
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"{label} proxy {PROXY_BIND}:{port} -> {up[0]}:{up[1]}", flush=True)
+
+# ===== Finding model servers on this machine =====
+# A read-only look at which ports are listening, then one short GET /v1/models on anything that is not
+# on the ignore list and is not a port this dashboard itself opened. Never a prompt. Never the server's own port.
+# Ollama keeps the counting proxy it already has. llama.cpp keeps the log tail when that is turned on.
+DEFAULT_IGNORE = (11434, 11435, 11480)   # Ollama, the Ollama counting port, the dashboard
+PORT_SAVED = {}    # port settings saved from the gear window
+FOUND_NOTES = []   # servers we saw but did not open a counting port for (log tail, or a port the user told us to skip)
+LOG_ONLY = []
+try: SCAN_EVERY = max(2.0, float(os.environ.get("SCAN_EVERY", "5")))
+except ValueError: SCAN_EVERY = 5.0
+PROBE_TIMEOUT = 0.4
+NAME_OK = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+HOST_OK = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+_NEG = {}   # port -> last time a GET /v1/models said "not a model server"
+
+def counting_url(port):
+    if not port: return None
+    return "http://127.0.0.1:%d/v1" % int(port)
+
+def _port_num(v, label):
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)): raise ValueError("%s must be a port number" % label)
+    try: n = int(str(v).strip())
+    except ValueError: raise ValueError("%s must be a port number" % label)
+    if not 1 <= n <= 65535: raise ValueError("%s must be between 1 and 65535" % label)
+    return n
+
+def _parse_port_list(raw):
+    out = []
+    if raw is None: return out
+    if isinstance(raw, str): raw = [x for x in re.split(r"[^0-9]+", raw) if x]
+    if not isinstance(raw, (list, tuple)): raise ValueError("The ignore list must be a list of ports.")
+    if len(raw) > 200: raise ValueError("The ignore list can hold at most 200 ports.")
+    for p in raw: out.append(_port_num(p, "An ignored port"))
+    return sorted(set(out))
+
+def port_env_ignore():
+    """Ports named in PORT_IGNORE. A bad token is skipped with a warning, never a crash."""
+    raw = os.environ.get("PORT_IGNORE")
+    if not raw: return []
+    try: return _parse_port_list(raw)
+    except ValueError as e:
+        print("ignoring PORT_IGNORE=%r (%s)" % (raw, e), file=sys.stderr, flush=True); return []
+
+def auto_detect_on():
+    """Saved setting, then AUTO_DETECT=0, then on. On is the normal way to run."""
+    if "auto" in PORT_SAVED: return bool(PORT_SAVED["auto"])
+    return os.environ.get("AUTO_DETECT", "1") != "0"
+
+def configured_ignore():
+    """The list the user can edit. The live skip list adds this dashboard's own ports on top."""
+    if "ignore" in PORT_SAVED: return set(int(p) for p in PORT_SAVED["ignore"])
+    s = set(DEFAULT_IGNORE)
+    s.add(int(DASH_PORT)); s.add(int(PROXY_PORT)); s.add(int(UP_PORT))
+    s.update(port_env_ignore())
+    return s
+
+def own_ports():
+    """Ports this process is responsible for. Never probed, even if someone deletes them from the list."""
+    s = {int(DASH_PORT)}
+    s.add(int(PROXY_PORT)); s.add(int(UP_PORT))
+    for rt in list(RUNTIMES):
+        if rt.get("listen"): s.add(int(rt["listen"]))
+    return s
+
+def skip_ports():
+    return configured_ignore() | own_ports()
+
+def explicit_proxy_specs():
+    """Counting ports the user named with environment variables. An empty OPENAI_PROXIES means none."""
+    if OPENAI_PROXIES is not None: return OPENAI_PROXIES
+    e, out = os.environ.get, []
+    if "vllm" in ENGINES and any(k in os.environ for k in ("VLLM_PROXY_PORT", "VLLM_UPSTREAM_HOST", "VLLM_UPSTREAM_PORT")):
+        out.append("vllm:%s=%s:%s" % (e("VLLM_PROXY_PORT", "8001"), e("VLLM_UPSTREAM_HOST", "127.0.0.1"), e("VLLM_UPSTREAM_PORT", "8000")))
+    if "sglang" in ENGINES and any(k in os.environ for k in ("SGLANG_PROXY_PORT", "SGLANG_UPSTREAM_HOST", "SGLANG_UPSTREAM_PORT")):
+        out.append("sglang:%s=%s:%s" % (e("SGLANG_PROXY_PORT", "30001"), e("SGLANG_UPSTREAM_HOST", "127.0.0.1"), e("SGLANG_UPSTREAM_PORT", "30000")))
+    if "llamacpp" in ENGINES and not LLAMA_LOG and any(k in os.environ for k in ("LLAMACPP_PROXY_PORT", "LLAMACPP_UPSTREAM_HOST", "LLAMACPP_UPSTREAM_PORT")):
+        out.append("llamacpp:%s=%s:%s" % (e("LLAMACPP_PROXY_PORT", "8081"), e("LLAMACPP_UPSTREAM_HOST", "127.0.0.1"), e("LLAMACPP_UPSTREAM_PORT", "8080")))
+    return ",".join(out)
+
+def startup_specs():
+    """Auto-detect on: only the ports the user named. Auto-detect off: the same defaults as before."""
+    return explicit_proxy_specs() if auto_detect_on() else proxy_specs()
+
+def validate_ports(body):
+    """Port settings from the gear window. Returns (errors, cleaned). errors is empty when cleaned is usable."""
+    if not isinstance(body, dict): return {"ports": "Send the port settings as an object."}, None
+    errors = {}
+    auto = body.get("auto", True)
+    if not isinstance(auto, bool): errors["auto"] = "Choose on or off for finding servers automatically."
+    try: ignore = _parse_port_list(body.get("ignore", []))
+    except ValueError as e: errors["ignore"] = str(e); ignore = []
+    manual, raw_m = [], body.get("manual", [])
+    if not isinstance(raw_m, list): errors["manual"] = "The extra servers must be a list."; raw_m = []
+    elif len(raw_m) > 40: errors["manual"] = "At most 40 extra servers."
+    for m in raw_m:
+        if not isinstance(m, dict): errors["manual"] = "Each extra server needs a name, a host and a port."; break
+        name = str(m.get("name") or "openai").strip().lower()
+        if not NAME_OK.match(name): errors["manual"] = "Names use letters, numbers, _ and -, and stay under 32 characters."; break
+        host = str(m.get("host") or "127.0.0.1").strip()
+        if not HOST_OK.match(host) or ".." in host: errors["manual"] = "Host must look like 127.0.0.1, with no http:// and no slash."; break
+        try: port = _port_num(m.get("port"), "Server port")
+        except ValueError as e: errors["manual"] = str(e); break
+        item = {"name": name, "host": host, "port": port}
+        if m.get("listen") not in (None, "", 0):
+            try: listen = _port_num(m.get("listen"), "Counting port")
+            except ValueError as e: errors["manual"] = str(e); break
+            if listen == port: errors["manual"] = "The counting port has to be a different port from the server."; break
+            item["listen"] = listen
+        if port in set(ignore) or port == int(DASH_PORT):
+            errors["manual"] = "Port %d is excluded, so it cannot be added as a server." % port; break
+        manual.append(item)
+    listen, raw_l = {}, body.get("listen", {})
+    if raw_l in (None, ""): raw_l = {}
+    if not isinstance(raw_l, dict): errors["listen"] = "A counting-port override is a server port and the port you want programs to use."; raw_l = {}
+    elif len(raw_l) > 40: errors["listen"] = "At most 40 counting-port overrides."
+    for k, v in raw_l.items():
+        try: up, lp = _port_num(k, "Server port"), _port_num(v, "Counting port")
+        except ValueError as e: errors["listen"] = str(e); break
+        if up == lp: errors["listen"] = "The counting port has to be a different port from the server."; break
+        if up in set(ignore) or up == int(DASH_PORT): errors["listen"] = "Port %d is excluded, so it cannot have a counting port." % up; break
+        listen[str(up)] = lp
+    if errors: return errors, None
+    return {}, {"auto": bool(auto), "ignore": ignore, "manual": manual, "listen": listen}
+
+def port_load_saved(c):
+    PORT_SAVED.clear()
+    row = c.execute("SELECT value FROM settings WHERE key='ports'").fetchone()
+    if not row: return
+    try: saved = json.loads(row[0])
+    except Exception: return
+    errors, cleaned = validate_ports(saved if isinstance(saved, dict) else {})
+    if errors:
+        print("ignoring saved port settings:", "; ".join("%s: %s" % kv for kv in errors.items()), file=sys.stderr, flush=True); return
+    PORT_SAVED.update(cleaned)
+
+def listen_overrides():
+    out = {}
+    for k, v in (PORT_SAVED.get("listen") or {}).items():
+        try: out[int(k)] = int(v)
+        except (TypeError, ValueError): continue
+    return out
+
+def _local_bind(ip_hex):
+    """True when a listening socket is reachable as localhost. /proc stores the address in hex."""
+    if len(ip_hex) == 8: return ip_hex in ("00000000", "0100007F")   # 0.0.0.0 and 127.0.0.1
+    if len(ip_hex) == 32: return ip_hex == "0" * 32 or ip_hex == "00000000000000000000000001000000"   # :: and ::1
+    return False
+
+def listening_local_ports(text=None):
+    """Ports on this machine that accept local connections. Reads the kernel table. Sends nothing."""
+    if text is not None:
+        blobs = [text]
+    else:
+        blobs = []
+        for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try: blobs.append(open(path).read())
+            except OSError: continue
+    ports = set()
+    for blob in blobs:
+        for line in blob.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4 or parts[3] != "0A": continue   # 0A is LISTEN
+            try: ip_hex, port_hex = parts[1].split(":")
+            except ValueError: continue
+            if not _local_bind(ip_hex): continue
+            try: port = int(port_hex, 16)
+            except ValueError: continue
+            if 0 < port <= 65535: ports.add(port)
+    return ports
+
+def probe_models(host, port, timeout=None):
+    """One GET /v1/models. Returns a label, or None when nothing model-like answered. Never a prompt."""
+    timeout = PROBE_TIMEOUT if timeout is None else timeout
+    c = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        c.request("GET", "/v1/models")
+        r = c.getresponse()
+        server = (r.getheader("Server") or "").lower()
+        body = r.read(65536)
+        status = r.status
+    except Exception:
+        return None
+    finally:
+        try: c.close()
+        except Exception: pass
+    if status != 200: return None
+    try: o = json.loads(body)
+    except Exception: return None
+    if not isinstance(o, dict) or not isinstance(o.get("data"), list): return None
+    if o.get("object") not in (None, "list"): return None
+    owners = set()
+    for m in o["data"]:
+        if isinstance(m, dict): owners.add(str(m.get("owned_by", "")).lower())
+    if "tensorfold" in owners or "tensorfold" in server: return "tensorfold"
+    for k in ("vllm", "sglang", "llamacpp", "ollama"):
+        if k in owners: return k
+    if "sglang" in server: return "sglang"
+    return "openai"
+
+def port_available(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((PROXY_BIND if PROXY_BIND else "0.0.0.0", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try: s.close()
+        except Exception: pass
+
+def choose_listen(upstream, prefer=None):
+    """A free port next to the server. Never the server's own port. None when the user's chosen port is busy or excluded."""
+    skip = skip_ports()
+    upstream = int(upstream)
+    if prefer is not None:
+        prefer = int(prefer)
+        if prefer == upstream or prefer in skip or not port_available(prefer): return None
+        return prefer
+    nxt = upstream + 1
+    for p in range(nxt, min(65536, nxt + 40)):
+        if p in skip: continue
+        if not port_available(p): continue
+        if p != nxt:
+            why = "on the leave-alone list" if nxt in skip else "already in use"
+            print("warning: counting port %d is %s, using %d for the server on %d. The dashboard keeps running." % (nxt, why, p, upstream), file=sys.stderr, flush=True)
+        return p
+    print("warning: no free counting port near %d. That server was skipped. The dashboard keeps running." % upstream, file=sys.stderr, flush=True)
+    return None
+
+def stop_runtime(rt):
+    srv = rt.get("srv")
+    if srv:
+        try: srv.shutdown()
+        except Exception: pass
+        try: srv.server_close()
+        except Exception: pass
+    try: RUNTIMES.remove(rt)
+    except ValueError: pass
+
+def _proxy_for(host, port, how=None):
+    for rt in list(RUNTIMES):
+        if rt.get("up") == (host, int(port)) and (how is None or rt.get("how") == how): return rt
+    return None
+
+def open_counting_proxy(kind, host, port, listen, how):
+    """Open a counting proxy. The server port itself is never bound."""
+    port, listen = int(port), int(listen)
+    if listen == port: return None
+    if _proxy_for(host, port): return _proxy_for(host, port)
+    label = re.sub(r"\W", "_", str(kind))[:24] or "openai"
+    H = type("Proxy_%s_%d" % (label, port), (Proxy,), {"UPH": host, "UPP": port, "SRC": kind})
+    before = len(RUNTIMES)
+    start_proxy(H, kind, listen, (host, port), how=how)
+    rt = RUNTIMES[-1] if len(RUNTIMES) > before else None
+    return rt
+
+def apply_manual_servers():
+    want = []
+    for m in PORT_SAVED.get("manual") or []:
+        try: want.append((m.get("host") or "127.0.0.1", int(m["port"]), m))
+        except (KeyError, TypeError, ValueError): continue
+    wanted = {(h, p) for h, p, _ in want}
+    for rt in list(RUNTIMES):
+        if rt.get("how") == "manual" and rt.get("up") not in wanted: stop_runtime(rt)
+    for host, port, m in want:
+        if port in skip_ports() and port != int(UP_PORT): continue
+        if _proxy_for(host, port): continue
+        prefer = m.get("listen") or listen_overrides().get(port)
+        listen = choose_listen(port, prefer)
+        if listen is None:
+            print("warning: %s on %s:%d skipped, counting port %s is not free. The dashboard keeps running." % (m.get("name") or "server", host, port, prefer or "nearby"), file=sys.stderr, flush=True)
+            continue
+        open_counting_proxy(m.get("name") or "openai", host, port, listen, "manual")
+
+def apply_port_config():
+    """Make the saved port settings true right away. Turns auto-found proxies off when auto-detect is off or the port is now excluded."""
+    if not auto_detect_on():
+        LOG_ONLY[:] = []
+        for rt in list(RUNTIMES):
+            if rt.get("how") == "found": stop_runtime(rt)
+    skip = skip_ports()
+    for rt in list(RUNTIMES):
+        if rt.get("how") == "found" and rt["up"][1] in skip: stop_runtime(rt)
+    apply_manual_servers()
+
+def _note(kind, port, how, detail):
+    return {"label": SOURCE_LABELS.get(kind, kind), "src": kind, "listen": None, "up": "127.0.0.1:%d" % port,
+            "upstream_port": port, "ok": True, "error": None, "how": how, "counting": None, "detail": detail}
+
+def scan_once(ports=None):
+    """Look for new local model servers and open a counting port beside each one. Returns the ports that were probed."""
+    LOG_ONLY[:] = []
+    if not auto_detect_on(): return []
+    skip = skip_ports()
+    known = {rt["up"][1] for rt in list(RUNTIMES) if rt.get("up") and rt["up"][0] in ("127.0.0.1", "localhost")}
+    probed = []
+    now = time.time()
+    for port in sorted(listening_local_ports() if ports is None else ports):
+        if port in skip or port in known or port < 1024: continue
+        if port in _NEG and now - _NEG[port] < 60: continue
+        probed.append(port)
+        kind = probe_models("127.0.0.1", port)
+        if not kind:
+            _NEG[port] = now; continue
+        _NEG.pop(port, None)
+        if kind == "ollama":
+            LOG_ONLY.append(_note("ollama", port, "ollama", "Ollama keeps its own counting address on port %d." % PROXY_PORT))
+            continue
+        if kind == "llamacpp" and LLAMA_LOG:
+            LOG_ONLY.append(_note("llamacpp", port, "log", "Counted from the llama.cpp log. No extra address, so this request is not counted twice."))
+            continue
+        prefer = listen_overrides().get(port)
+        if prefer and (prefer in skip or prefer == port or not port_available(prefer)):
+            print("warning: %s on port %d skipped, counting port %d is not free. The dashboard keeps running." % (SOURCE_LABELS.get(kind, kind), port, prefer), file=sys.stderr, flush=True)
+            LOG_ONLY.append(_note(kind, port, "found", "Counting port %d is not free. Pick another one in Settings." % prefer))
+            _NEG[port] = now; continue
+        listen = choose_listen(port, prefer)
+        if listen is None:
+            _NEG[port] = now; continue
+        open_counting_proxy(kind, "127.0.0.1", port, listen, "found")
+        known.add(port)
+    return probed
+
+def watch_loop():
+    tick = 0
+    while True:
+        try:
+            apply_port_config()
+            if auto_detect_on(): scan_once()
+            tick += 1
+            if tick % 6 == 1: check_runtimes()
+        except Exception as e: print("port watch error:", e, file=sys.stderr, flush=True)
+        time.sleep(SCAN_EVERY)
+
+def server_rows():
+    rows = []
+    for rt in list(RUNTIMES):
+        rows.append({"label": SOURCE_LABELS.get(rt["src"], rt["src"]), "src": rt["src"], "listen": rt.get("listen"),
+                     "up": "%s:%d" % rt["up"], "upstream_port": rt["up"][1], "ok": rt.get("ok"), "error": rt.get("error"),
+                     "how": rt.get("how") or "", "counting": counting_url(rt["listen"]) if rt.get("started") else None, "detail": ""})
+    rows.extend(LOG_ONLY)
+    return rows
+
+def ports_public():
+    ign = sorted(configured_ignore())
+    return {"auto": auto_detect_on(), "ignore": ign, "manual": list(PORT_SAVED.get("manual") or []),
+            "listen": {str(k): v for k, v in listen_overrides().items()},
+            "defaults": {"auto": True, "ignore": sorted(set(DEFAULT_IGNORE) | {int(DASH_PORT), int(PROXY_PORT), int(UP_PORT)})},
+            "servers": server_rows(),
+            "note": "Programs are counted only when they use the counting address."}
 
 GIN = re.compile(r'\[GIN\] (\d{4}/\d\d/\d\d - \d\d:\d\d:\d\d) \| (\d+) \|\s+([\d.]+)(ns|µs|us|ms|s|m)?\S* \|\s+(\S+) \| (\w+)\s+"([^"]+)"')
 UNIT = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1, "m": 60, None: 1}
@@ -814,6 +1185,11 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;ma
 .x10{flex:none;margin-left:calc(var(--dw)/3);white-space:nowrap;font-size:calc(var(--dh)*.6)}.x10 sup{font-size:.6em;vertical-align:.9em;margin-left:2px}.odo.sci .dig:last-of-type{box-shadow:0 0 0 1px #3f7a00}.dig.tick{animation:tick .5s}@keyframes tick{0%{box-shadow:0 0 8px 2px var(--g)}100%{box-shadow:0 0 0 1px #3f7a00}}.words{color:#9fd14a;font-size:13px;font-weight:600}
 .scroll{max-height:380px;overflow:auto;border-radius:10px;scrollbar-color:#2f4a10 #0b0d10}.scroll .muted td{position:sticky;top:0;background:#14171d;z-index:1}#ledger{max-height:420px}#ledger .muted td{background:#0b0d10}
 .rts{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;margin-left:auto}.chip.down{border-style:dashed;color:#6b7285;border-color:#2a2f3a;background:none}.chip.busy{color:#ffb84d;border-color:#6b4a00;background:#2a1d00}
+.countwarn{border:1px solid #6b4a00;background:#2a1d00;color:#ffe0b0;border-radius:12px;padding:10px 14px;margin:14px 0 0;font-size:14px;line-height:1.45}.countwarn b{color:#ffb84d}
+#countList{margin-top:8px}#countList .btn{margin-left:6px}
+#setDlg input[type=checkbox]{width:auto;margin:0 8px 0 0}#setDlg input.wide{width:100%;margin:4px 0;box-sizing:border-box}
+#portBox .sh{margin-top:8px}#portServers{display:flex;flex-direction:column;gap:6px;margin:8px 0}#portServers .prow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;border:1px solid #232833;border-radius:10px;padding:8px 10px}
+#portBox .sr input{min-width:0}
 #shareDlg{max-width:min(92vw,820px)}#shareDlg img{display:block;width:100%;border-radius:10px;border:1px solid #2f4a10;margin:10px 0 14px}.dacts{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
 .trip .btn{margin-top:14px}
 .big{font-size:30px;font-weight:700;color:var(--g);font-variant-numeric:tabular-nums}.med{font-size:24px;font-weight:700;color:var(--g);font-variant-numeric:tabular-nums}.lbl{color:#9aa3b5;font-size:13px}
@@ -878,6 +1254,8 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 </style></head><body>
 <div class=top><div class=brand><div class=mascot id=mascot><img id=mascotImg src="static/mascot-idle.webp" width=80 height=80 alt="Angry chip robot inhaling tokens"></div><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Preview a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
 <div class=fbar><div class=seg id=seg><button data-d=1>24 hours</button><button data-d=7>7 days</button><button data-d=30>30 days</button><button data-d=60>60 days</button><button data-d=90>90 days</button><button data-d=0>All time</button></div><span class=muted id=segSub></span><div class=rts id=rts></div></div>
+<p class=countwarn id=countWarn><b>Counted only at the counting address.</b> A program that talks straight to the model server is invisible here. Copy a counting address below, or open Settings to add a server and to leave ports alone.</p>
+<div class=chips id=countList></div>
 <div class="row r1">
  <div class=card id=odoCard><h2 id=odoH>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=words id=odoWords></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
   <div class=lbl id=rngLbl style="margin-top:14px;color:#9fd14a"></div><div class=grid style="margin-top:6px"><div><div class=lbl>Prompts devoured (input)</div><div class=med id=tin></div></div><div><div class=lbl>Vocabulary purged (output)</div><div class=med id=tout></div></div><div><div class=lbl>Lineages erased (requests)</div><div class=med id=nreq></div></div><div><div class=lbl>Avg extermination speed</div><div class=med id=avg></div></div></div></div>
@@ -906,8 +1284,8 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 <p class=muted>No GPUs were harmed. Entire bloodlines of cloud invoices were. <button class=tiny id=msTest title="Preview the 1 billion celebration (does not count)">🎉 test the party</button></p>
 <div class=upd><button class=btn id=updBtn title="Check the official GitHub releases and install a newer one">Update</button><span class=muted id=updHint>checking for updates…</span></div>
 <dialog id=updDlg><form method=dialog><b style="color:var(--g)" id=updTitle>Dashboard update</b><div id=updBody style="margin-top:8px"></div><div class=dacts style="margin-top:14px"><button class=btn value=cancel>Close</button><button class=btn id=updGo value=ok hidden>Install</button></div></form></dialog>
-<button class="btn gear" id=setBtn title="Settings: milestones and badges" aria-label="Settings">⚙</button>
-<dialog id=setDlg aria-labelledby=setTitle><div class=sth><b id=setTitle>Settings</b><button type=button class="btn xs" id=setX aria-label="Close settings">✕</button></div><div class=stb id=setScroll><div class=muted style="margin:4px 0 6px">Milestones: when the dashboard throws a party and earns a badge. Changes apply right away and are remembered (saved settings win over <code>MS_*</code> environment variables, which win over the built-in defaults). Use K, M, B and T for thousands, millions, billions and trillions, like <b>5B</b>.</div><div id=setBody></div></div><div class=stf><div class=serr id=setErr role=status></div><div class=dacts><button type=button class="btn red" id=setReset title="Forget saved settings and go back to the defaults">Reset to defaults</button><span><button type=button class=btn id=setCancel>Cancel</button><button type=button class=btn id=setSave>Save</button></span></div></div></dialog>
+<button class="btn gear" id=setBtn title="Settings: counting addresses, ports to leave alone, milestones" aria-label="Settings">⚙</button>
+<dialog id=setDlg aria-labelledby=setTitle><div class=sth><b id=setTitle>Settings</b><button type=button class="btn xs" id=setX aria-label="Close settings">✕</button></div><div class=stb id=setScroll><div id=portBox></div><div class=muted style="margin:4px 0 6px">Milestones: when the dashboard throws a party and earns a badge. Changes apply right away and are remembered (saved settings win over <code>MS_*</code> environment variables, which win over the built-in defaults). Use K, M, B and T for thousands, millions, billions and trillions, like <b>5B</b>.</div><div id=setBody></div></div><div class=stf><div class=serr id=setErr role=status></div><div class=dacts><button type=button class="btn red" id=setReset title="Forget saved settings and go back to the defaults">Reset to defaults</button><span><button type=button class=btn id=setCancel>Cancel</button><button type=button class=btn id=setSave>Save</button></span></div></div></dialog>
 <div id=tip></div>
 <script>
 const D=__DATA__;
@@ -993,7 +1371,11 @@ $('msToggle').onclick=()=>{msOpen=!msOpen;renderMs()}
 function msNext(c,cur){let best=Infinity,prev=0;for(const v of c.fixed)if(v>cur&&v<best)best=v;for(const [hi,st] of c.tiers){const v=(Math.floor(Math.max(cur,prev)/st)+1)*st;if(hi==null||v<=hi){if(v<best)best=v;break}prev=hi}return best}
 function nextMilestone(){const tok=tin+tout,sv=hero?cost(hero,tin,tout):0,C=ST.ms_cfg;const nt=msNext(C.tok,tok),ns=msNext(C.usd,sv);
  $('nextMs').textContent=`Next party: ${bigNum(nt).toLowerCase()} tokens (${fmt(nt-tok)} to go)`+(hero?` · $${fmt(ns)} saved ($${(ns-sv).toFixed(2)} to go)`:'')}
-function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();nextMilestone()}
+function renderCount(){const rows=(ST.runtimes||[]).filter(r=>r.counting);$('countList').innerHTML=rows.map(r=>`<span class=chip>${esc(r.label)} <b>${esc(r.counting)}</b> <button type=button class="btn xs" data-copy="${esc(r.counting)}">Copy</button></span>`).join('')||'<span class="chip soon">No counting address yet. When a model server is running on this machine, its address shows up here.</span>'}
+function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();renderCount();nextMilestone()}
+document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;const t=b.getAttribute('data-copy'),old=b.textContent;const done=()=>{b.textContent='Copied';setTimeout(()=>{b.textContent=old},1200)};
+ const fb=()=>{const i=document.createElement('textarea');i.value=t;document.body.appendChild(i);i.select();try{document.execCommand('copy');done()}catch(_){}i.remove()};
+ if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(done).catch(fb);else fb()});
 let rT=null,lastR=0;function refreshSoon(){if(rT)return;rT=setTimeout(()=>{rT=null;lastR=Date.now();refreshNow()},Math.max(3000,10000-(Date.now()-lastR)))}
 // trip reset
 $('tripBtn').onclick=()=>{$('tripName').value='';$('tripDlg').showModal()};
@@ -1041,7 +1423,30 @@ function sBuild(){const out={},bad=new Set();let err='';const fail=(m,el)=>{if(!
  const pv=Number(SF.preview);if(!Number.isInteger(pv)||pv<1||pv>50)fail('Badge preview must be a whole number from 1 to 50',['p']);out.preview=pv;return{out,err,bad}}
 function sCheck(){if(!SF)return;const {err,bad}=sBuild();$('setErr').className='serr';$('setErr').textContent=err;$('setSave').disabled=!!err;
  $('setBody').querySelectorAll('input').forEach(el=>{const d=el.dataset,k=d.k=='t'?[d.g,'t',+d.i,+d.c]:d.k=='o'?[d.g,'o']:d.k=='f'?[d.g,'f',+d.i]:['p'];el.setAttribute('aria-invalid',[...bad].some(b=>b.join()==k.join()))})}
-function sLoad(r){SF=sFrom(r.settings);sRender()}
+function sLoad(r){SF=sFrom(r.settings);sRender();pLoad(r)}
+let PF=null,portTimer=null;
+function pLoad(r){const p=r.ports||{auto:true,ignore:[],manual:[],listen:{},servers:[]};PF={auto:!!p.auto,ignore:(p.ignore||[]).join(', '),
+ manual:(p.manual||[]).map(m=>({name:m.name||'',host:m.host||'127.0.0.1',port:m.port!=null?String(m.port):'',listen:m.listen?String(m.listen):''})),
+ overs:Object.entries(p.listen||{}).map(([up,listen])=>({up:String(up),listen:String(listen)})),servers:p.servers||[]};pRender()}
+function pServers(){const box=$('portServers');if(!box||!PF)return;box.innerHTML=(PF.servers||[]).map(s=>{const addr=s.counting?`<b>${esc(s.counting)}</b> <button type=button class="btn xs" data-copy="${esc(s.counting)}">Copy</button>`:(s.detail?esc(s.detail):'no counting address');
+ return `<div class=prow><b>${esc(s.label||s.src||'Server')}</b><span>server port ${esc(s.upstream_port!=null?s.upstream_port:(s.up||''))}</span><span>${addr}</span>${s.error?`<span class=busy>${esc(s.error)}</span>`:''}</div>`}).join('')||'<div class=sh>None yet. A model server on this machine shows up here within a few seconds.</div>'}
+function pRender(){if(!PF)return;$('portBox').innerHTML=`<fieldset class=sg><legend>Ports</legend>
+<p class=sh style="font-size:13px;color:#ffe0b0">Programs are counted only when they use the <b>counting address</b>. The model server keeps its own port. This page only reads <code>/v1/models</code>. It never sends a prompt and never takes the server's port.</p>
+<label class=sr><input type=checkbox id=portAuto ${PF.auto?'checked':''}> Look for model servers on this machine</label>
+<div class=sh>Found servers</div><div id=portServers></div>
+<div class=sh>Ports to leave alone</div>
+<input id=portIgnore class=wide value="${esc(PF.ignore)}" aria-label="Ports to leave alone" placeholder="3000, 8001">
+<div class=sh>Comma-separated. Ollama (11434) and this dashboard are already skipped, and so is every counting port this page opens. Add any other app, for example <b>3000</b> or <b>8001</b>.</div>
+<div class=sh>Add a server by hand</div>`+PF.manual.map((m,i)=>`<div class='sr t'><input data-p=name data-i=${i} value="${esc(m.name)}" placeholder="vllm" aria-label="Server name ${i+1}"><input data-p=host data-i=${i} value="${esc(m.host)}" placeholder="127.0.0.1" aria-label="Server host ${i+1}"><input data-p=port data-i=${i} value="${esc(m.port)}" placeholder="server port" aria-label="Server port ${i+1}"><input data-p=listen data-i=${i} value="${esc(m.listen)}" placeholder="counting port" aria-label="Counting port ${i+1}"><button type=button class="btn xs" data-pact=dm data-i=${i} aria-label="Remove server ${i+1}">✕</button></div>`).join('')
++`<button type=button class="btn xs" data-pact=am>+ Add server</button>
+<div class=sh>Prefer a counting port</div>`+PF.overs.map((o,i)=>`<div class='sr t'>Server port <input data-p=oup data-i=${i} value="${esc(o.up)}" aria-label="Override server port ${i+1}"> uses counting port <input data-p=olis data-i=${i} value="${esc(o.listen)}" aria-label="Override counting port ${i+1}"><button type=button class="btn xs" data-pact=do data-i=${i} aria-label="Remove override ${i+1}">✕</button></div>`).join('')
++`<button type=button class="btn xs" data-pact=ao>+ Add override</button></fieldset>`;pServers()}
+function pBuild(){const ignore=PF.ignore.split(/[^0-9]+/).filter(Boolean).map(n=>Number(n));const manual=[];
+ for(const m of PF.manual){if(!String(m.port).trim())continue;
+  const item={name:(m.name||'openai').trim().toLowerCase()||'openai',host:(m.host||'127.0.0.1').trim()||'127.0.0.1',port:Number(m.port)};
+  if(String(m.listen).trim())item.listen=Number(m.listen);manual.push(item)}
+ const listen={};for(const o of PF.overs){if(!String(o.up).trim()||!String(o.listen).trim())continue;listen[String(Number(o.up))]=Number(o.listen)}
+ return {auto:!!PF.auto,ignore,manual,listen}}
 async function sGet(){const r=await fetch('api/settings',{cache:'no-store'});if(!r.ok)throw 0;return r.json()}
 async function sPost(b){const r=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j={};try{j=await r.json()}catch(_){}return{ok:r.ok&&j.ok,j}}
 // keep the window inside the *visible* viewport (mobile browser toolbars show and hide) and freeze the page behind it
@@ -1051,15 +1456,20 @@ function sLock(){if(sLocked)return;sLocked=true;sY=scrollY;const b=document.body
  addEventListener('resize',sFit);if(window.visualViewport){visualViewport.addEventListener('resize',sFit);visualViewport.addEventListener('scroll',sFit)}}
 function sUnlock(){if(!sLocked)return;sLocked=false;const b=document.body.style;b.position=b.top=b.left=b.right=b.width='';document.documentElement.classList.remove('setlock');
  removeEventListener('resize',sFit);if(window.visualViewport){visualViewport.removeEventListener('resize',sFit);visualViewport.removeEventListener('scroll',sFit)}scrollTo(0,sY)}
-$('setDlg').addEventListener('close',sUnlock);
-$('setBtn').onclick=async()=>{try{sLoad(await sGet());sLock();$('setDlg').showModal();$('setScroll').scrollTop=0}catch(_){sUnlock();alert('Could not load the settings.')}};
+function portWatch(on){clearInterval(portTimer);portTimer=null;if(!on)return;portTimer=setInterval(async()=>{try{const r=await sGet();if(PF&&r.ports){PF.servers=r.ports.servers||[];pServers()}}catch(_){}},5000)}
+$('setDlg').addEventListener('close',()=>{sUnlock();portWatch(false)});
+$('setBtn').onclick=async()=>{try{sLoad(await sGet());sLock();$('setDlg').showModal();$('setScroll').scrollTop=0;portWatch(true)}catch(_){sUnlock();alert('Could not load the settings.')}};
 $('setCancel').onclick=()=>$('setDlg').close();$('setX').onclick=()=>$('setDlg').close();
+$('portBox').addEventListener('input',e=>{if(!PF)return;const t=e.target,d=t.dataset;if(t.id=='portAuto'){PF.auto=t.checked;return}if(t.id=='portIgnore'){PF.ignore=t.value;return}if(!d.p)return;const row=d.p.startsWith('o')?PF.overs:PF.manual;const key=d.p=='oup'?'up':d.p=='olis'?'listen':d.p;if(row[+d.i])row[+d.i][key]=t.value});
+$('portBox').addEventListener('click',e=>{const b=e.target.closest('[data-pact]');if(!b||!PF)return;const i=+b.dataset.i;
+ if(b.dataset.pact=='dm')PF.manual.splice(i,1);else if(b.dataset.pact=='am')PF.manual.push({name:'',host:'127.0.0.1',port:'',listen:''});
+ else if(b.dataset.pact=='do')PF.overs.splice(i,1);else if(b.dataset.pact=='ao')PF.overs.push({up:'',listen:''});pRender()});
 $('setBody').addEventListener('input',e=>{const d=e.target.dataset,v=e.target.value;if(!d.k||!SF)return;if(d.k=='t')SF[d.g].tiers[+d.i][+d.c]=v;else if(d.k=='o')SF[d.g].open=v;else if(d.k=='f')SF[d.g].fixed[+d.i]=v;else if(d.k=='p')SF.preview=v;sCheck()});
 $('setBody').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;const d=b.dataset,g=d.g;
  if(d.act=='dt')SF[g].tiers.splice(+d.i,1);else if(d.act=='df')SF[g].fixed.splice(+d.i,1);else if(d.act=='at')SF[g].tiers.push(['','']);else if(d.act=='af')SF[g].fixed.push('');
  sRender();if(d.act=='at'||d.act=='af'){const l=[...$('setBody').querySelectorAll(`input[data-g=${g}][data-k=${d.act=='at'?'t':'f'}]`)];const el=d.act=='at'?l[l.length-2]:l[l.length-1];if(el)el.focus()}});
-$('setSave').onclick=async()=>{const {out,err}=sBuild();if(err)return;$('setSave').disabled=true;
- try{const {ok,j}=await sPost({settings:out});if(ok){$('setDlg').close();await refreshNow()}else{$('setErr').className='serr';$('setErr').textContent=Object.values(j.errors||{}).join(' ')||'The dashboard refused those settings.'}}catch(_){$('setErr').textContent='Could not save. Is the dashboard still running?'}$('setSave').disabled=false};
+$('setSave').onclick=async()=>{const {out,err}=sBuild();if(err||!PF)return;$('setSave').disabled=true;
+ try{const {ok,j}=await sPost({settings:out,ports:pBuild()});if(ok){$('setDlg').close();await refreshNow()}else{$('setErr').className='serr';$('setErr').textContent=Object.values(j.errors||{}).join(' ')||'The dashboard refused those settings.'}}catch(_){$('setErr').textContent='Could not save. Is the dashboard still running?'}$('setSave').disabled=false};
 $('setReset').onclick=async()=>{try{const {ok,j}=await sPost({reset:true});if(ok){sLoad(j);await refreshNow();$('setErr').className='serr sok';$('setErr').textContent='Back to the defaults. Saved settings cleared.'}}catch(_){$('setErr').textContent='Could not reset.'}};
 
 // milestones reached while nobody was watching: never replay a backlog. At most ONE party, for the most recent one crossed
@@ -2056,15 +2466,16 @@ if __name__ == "__main__":
     if LLAMA_LOG:
         threading.Thread(target=llama_loop, daemon=True).start()
         print("tailing llama.cpp log", LLAMA_LOG, "(read only; a missing file is fine)", flush=True)
-    for spec in filter(None, (x.strip() for x in proxy_specs().split(","))):
+    for spec in filter(None, (x.strip() for x in startup_specs().split(","))):
         src, _, rest = spec.partition(":"); lp, _, upstream = rest.partition("="); uh, _, upp = upstream.rpartition(":")
         H = type("Proxy_" + src, (Proxy,), {"UPH": uh or "127.0.0.1", "UPP": int(upp), "SRC": src})
-        start_proxy(H, src, int(lp), (H.UPH, H.UPP), auto=auto_proxies())
+        start_proxy(H, src, int(lp), (H.UPH, H.UPP), auto=auto_proxies() and not auto_detect_on(), how="env")
     print(f"dashboard http://{DASH_BIND}:{DASH_PORT}", flush=True)
     if OLLAMA_PROXY:
         if PROXY_SOURCE: Proxy.SRC = "proxy" if PROXY_SOURCE == "ollama" else PROXY_SOURCE
-        start_proxy(Proxy, Proxy.SRC, PROXY_PORT, (UP_HOST, UP_PORT))
-    threading.Thread(target=runtimes_loop, daemon=True).start()
+        start_proxy(Proxy, Proxy.SRC, PROXY_PORT, (UP_HOST, UP_PORT), how="ollama")
+    apply_port_config()
+    threading.Thread(target=watch_loop, daemon=True).start()
     DASH_SERVER = TS((DASH_BIND, DASH_PORT), Dash)
     try:
         DASH_SERVER.serve_forever()
