@@ -1927,5 +1927,145 @@ class PortDetectTests(unittest.TestCase):
         stop.set()
 
 
+class UsageAndMetricsTests(unittest.TestCase):
+    """Anthropic messages, a Maya model list, and a server token counter. Direct traffic is counted once."""
+
+    def test_anthropic_messages_and_openai_streams(self):
+        plain = '{"id":"msg_1","type":"message","role":"assistant","model":"inkling-2-mini","usage":{"input_tokens":4,"output_tokens":2}}'
+        self.assertEqual(parse(plain)[:3], ("inkling-2-mini", 4, 2))
+        cached = '{"model":"inkling-2-mini","usage":{"input_tokens":8,"cache_read_input_tokens":3,"cache_creation_input_tokens":1,"output_tokens":5}}'
+        self.assertEqual(parse(cached)[:3], ("inkling-2-mini", 12, 5))
+        stream = ("event: message_start\n"
+                  "data: {\"type\":\"message_start\",\"message\":{\"model\":\"inkling-2-mini\",\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n"
+                  "event: content_block_delta\n"
+                  "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+                  "event: message_delta\n"
+                  "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":8,\"cache_read_input_tokens\":3,\"output_tokens\":5}}\n\n"
+                  "event: message_stop\n"
+                  "data: {\"type\":\"message_stop\"}\n")
+        self.assertEqual(parse(stream)[:3], ("inkling-2-mini", 11, 5))
+        no_usage = 'data: {"model":"m","choices":[{"text":"hi"}]}\n\ndata: [DONE]\n'
+        self.assertEqual(parse(no_usage)[1:], (None, None, None))
+        with_usage = 'data: {"model":"m","choices":[{"text":"hi"}],"usage":null}\n\ndata: {"model":"m","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3}}\n\ndata: [DONE]\n'
+        self.assertEqual(parse(with_usage)[:3], ("m", 2, 3))
+        self.assertEqual(ta.add_usage_opt("/v1/messages", b'{"stream":true,"model":"m"}'), b'{"stream":true,"model":"m"}')
+        asked = json.loads(ta.add_usage_opt("/v1/chat/completions", b'{"stream":true,"model":"m"}'))
+        self.assertEqual(asked["stream_options"], {"include_usage": True})
+
+    def test_maya_model_list_is_not_a_generic_server(self):
+        body = json.dumps({"object": "list", "data": [{"id": "inkling-2-mini", "object": "model",
+                          "status": {"value": "loaded"}, "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]}}]}).encode()
+        s = Server(("127.0.0.1", 0), Handler); s.queue = {}; s.seen = []
+        s.gets = {"/v1/models": body.decode()}
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        try:
+            self.assertEqual(ta.probe_models("127.0.0.1", s.server_address[1]), "maya")
+            self.assertEqual(s.seen, [])
+        finally:
+            s.shutdown(); s.server_close()
+        sg = Server(("127.0.0.1", 0), Handler); sg.queue = {}; sg.seen = []
+        sg.gets = {"/v1/models": '{"object":"list","data":[{"id":"thinkingmachines/Inkling-2-Mini","owned_by":"sglang"}]}'}
+        threading.Thread(target=sg.serve_forever, daemon=True).start()
+        try: self.assertEqual(ta.probe_models("127.0.0.1", sg.server_address[1]), "sglang")
+        finally: sg.shutdown(); sg.server_close()
+
+    def test_counter_growth_skips_what_the_proxy_already_logged(self):
+        tmp = tempfile.mkdtemp(prefix="prom-"); old, tot, ms = ta.DB, tuple(ta.TOT), dict(ta.MS_SAVED)
+        ta.DB = os.path.join(tmp, "s.db"); ta.init_db()
+        sample = "\n".join([
+            "# HELP sglang:prompt_tokens_total Number of prefill tokens processed.",
+            "# TYPE sglang:prompt_tokens_total counter",
+            'sglang:prompt_tokens_total{model_name="thinkingmachines/Inkling-2-Mini",is_streaming="false"} 100',
+            'sglang:prompt_tokens_total{model_name="thinkingmachines/Inkling-2-Mini",is_streaming="true"} 20',
+            'sglang:generation_tokens_total{model_name="thinkingmachines/Inkling-2-Mini",is_streaming="false"} 40',
+            'sglang:generation_tokens_total{model_name="thinkingmachines/Inkling-2-Mini",is_streaming="true"} 10',
+        ])
+        self.assertEqual(ta.parse_prom_counters(sample), {"thinkingmachines/Inkling-2-Mini": (120, 50)})
+        self.assertIsNone(ta.parse_prom_counters('{"requests": []}'))
+        host, port, kind = "127.0.0.1", 39991, "sglang"
+        key = (host, port)
+        for box in (ta.METRIC_BASE, ta.METRIC_CARRY, ta.PROXIED, ta.NO_METRICS): box.pop(key, None)
+        self.assertEqual(ta.apply_metric_text(host, port, kind, sample), [])   # first read is the starting point
+        grown = sample.replace("100", "130").replace("40", "55")   # +30 prompt, +15 generation, other series unchanged
+        self.assertEqual(ta.apply_metric_text(host, port, kind, grown), [("thinkingmachines/Inkling-2-Mini", 30, 15)])
+        ta.note_proxied(host, port, 5, 7)
+        again = grown.replace("130", "135").replace("55", "62")   # +5 / +7, the request the proxy saw
+        self.assertEqual(ta.apply_metric_text(host, port, kind, again), [])
+        # the proxy logged tokens the counter has not published yet: they are not added, and not lost
+        ta.note_proxied(host, port, 4, 1)
+        self.assertEqual(ta.apply_metric_text(host, port, kind, again), [])
+        later = again.replace("135", "139").replace("62", "63")
+        self.assertEqual(ta.apply_metric_text(host, port, kind, later), [])
+        ta.DB = old; ta.TOT[:] = tot
+        ta.MS_SAVED.clear(); ta.MS_SAVED.update(ms); ta.ms_apply()
+
+    def test_ignored_port_is_not_read_for_counters(self):
+        calls = []
+        real = ta._metrics_text
+        ta._metrics_text = lambda h, p: calls.append(p) or None
+        saved = (dict(ta.PORT_SAVED), list(ta.RUNTIMES))
+        try:
+            ta.PORT_SAVED.clear(); ta.PORT_SAVED.update({"auto": True, "ignore": [3000, 8001], "manual": [], "listen": {}})
+            ta.RUNTIMES[:] = [{"src": "sglang", "listen": 30001, "up": ("127.0.0.1", 3000), "started": True, "how": "found"}]
+            ta.metrics_pass()
+            self.assertEqual(calls, [])
+        finally:
+            ta._metrics_text = real
+            ta.PORT_SAVED.clear(); ta.PORT_SAVED.update(saved[0]); ta.RUNTIMES[:] = saved[1]
+
+    def test_proxy_counts_messages_and_metrics_count_the_rest_once(self):
+        class M(Handler):
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                if path == "/metrics":
+                    body = self.server.prom.encode()
+                    self.send_response(200); self.send_header("Content-Type", "text/plain"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                if path == "/v1/models":
+                    body = b'{"object":"list","data":[{"id":"thinkingmachines/Inkling-2-Mini","owned_by":"sglang"}]}'
+                    self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                self._reply('{"error":"nope"}', 404)
+        prom = ['sglang:prompt_tokens_total{model_name="thinkingmachines/Inkling-2-Mini"} 10',
+                'sglang:generation_tokens_total{model_name="thinkingmachines/Inkling-2-Mini"} 4']
+        up = Server(("127.0.0.1", 0), M); up.queue = {"/v1/messages": ['{"id":"msg_1","type":"message","model":"inkling-2-mini","usage":{"input_tokens":6,"output_tokens":2}}']}
+        up.seen = []; up.prom = "\n".join(prom) + "\n"
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        tmp = tempfile.mkdtemp(prefix="metrics-"); saved = (ta.DB, tuple(ta.TOT), dict(ta.PORT_SAVED), list(ta.RUNTIMES), ta.PROXY_BIND, dict(ta.METRIC_BASE), dict(ta.PROXIED), dict(ta.METRIC_CARRY), dict(ta.MS_SAVED))
+        try:
+            ta.DB = os.path.join(tmp, "s.db"); ta.TOT[:] = (0, 0); ta.init_db()
+            ta.PORT_SAVED.clear(); ta.RUNTIMES[:] = []; ta.PROXY_BIND = "127.0.0.1"
+            ta.METRIC_BASE.clear(); ta.PROXIED.clear(); ta.METRIC_CARRY.clear()
+            port = up.server_address[1]
+            ta.scan_once(ports={port})
+            rt = ta._proxy_for("127.0.0.1", port)
+            self.assertIsNotNone(rt); self.assertEqual(rt["src"], "sglang"); self.assertNotEqual(rt["listen"], port)
+            ta.metrics_pass()   # baseline 10/4, nothing logged
+            prom[0] = prom[0].replace(" 10", " 25"); prom[1] = prom[1].replace(" 4", " 9")   # direct +15/+5
+            up.prom = "\n".join(prom) + "\n"
+            ta.metrics_pass()
+            self.assertEqual(req(rt["listen"], "POST", "/v1/messages", {"model": "inkling-2-mini", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})[0], 200)
+            seen = []; deadline = time.time() + 3
+            while time.time() < deadline and not seen:
+                seen = sqlite3.connect(ta.DB).execute("SELECT 1 FROM requests WHERE endpoint='/v1/messages'").fetchall(); time.sleep(0.02)
+            self.assertTrue(seen)
+            prom[0] = prom[0].replace(" 25", " 31"); prom[1] = prom[1].replace(" 9", " 11")   # the proxied +6/+2
+            up.prom = "\n".join(prom) + "\n"
+            ta.metrics_pass()
+            rows = sqlite3.connect(ta.DB).execute("SELECT source, model, endpoint, input_tokens, output_tokens FROM requests ORDER BY id").fetchall()
+            self.assertEqual(rows, [
+                ("sglang", "thinkingmachines/Inkling-2-Mini", "/metrics", 15, 5),
+                ("sglang", "inkling-2-mini", "/v1/messages", 6, 2),
+            ])
+        finally:
+            try: up.shutdown(); up.server_close()
+            except Exception: pass
+            for rt in list(ta.RUNTIMES): ta.stop_runtime(rt)
+            ta.DB, tot, ports, rts, bind, base, prox, carry, ms = saved
+            ta.DB = ta.DB; ta.TOT[:] = tot
+            ta.PORT_SAVED.clear(); ta.PORT_SAVED.update(ports); ta.RUNTIMES[:] = rts; ta.PROXY_BIND = bind
+            ta.METRIC_BASE.clear(); ta.METRIC_BASE.update(base); ta.PROXIED.clear(); ta.PROXIED.update(prox)
+            ta.METRIC_CARRY.clear(); ta.METRIC_CARRY.update(carry)
+            ta.MS_SAVED.clear(); ta.MS_SAVED.update(ms); ta.ms_apply()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,10 @@ The page says this in yellow, because it is the whole trick: **a program is coun
 
 The model server is never restarted, never sent a prompt, and never has its own port taken over.
 
+**Chat, completions, and Anthropic-style messages.** The counting address counts `/v1/chat/completions`, `/v1/completions`, and `/v1/messages`, streaming or not, from the `usage` numbers in the answer. On an OpenAI-style stream it asks for those numbers (`stream_options.include_usage`) when the program did not already ask. An Anthropic-style `/v1/messages` stream is left as the program sent it; the counts are read from the final event. A Maya server is recognized from its model list (a card with `architecture` and `status`, and no `owned_by`) and labelled **Maya**. Any other list is still counted, under **OpenAI-compatible** or the name the server gives.
+
+**Traffic that skips the counting address.** Some servers publish a running token total (SGLang's `/metrics` when it was started with `--enable-metrics`, vLLM's `/metrics`, or a Prometheus page at `/metrics/prometheus`). The dashboard reads that total every half minute. The first read is only a starting point. Later growth is counted, except the tokens the counting address already wrote down, so a request is not counted twice. Tokens from before the dashboard was watching are not added. A server with no counter, and a stream that never sends `usage`, is counted only when the program uses the counting address.
+
 Ollama is unchanged: it is still counted through port **11435**. llama.cpp is still counted from its log when that log is set, so the same requests are not counted twice.
 
 **Ports that are left alone.** These are never checked and never given a counting address:
