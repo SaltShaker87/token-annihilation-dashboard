@@ -8,8 +8,10 @@ After=network-online.target
 WorkingDirectory=%h/token-annihilation-dashboard
 # Uncomment and edit what you use (see README):
 # Ollama :11435 runs by default.
-# The dashboard looks on this machine for vLLM, SGLang and the other OpenAI-compatible servers
+# The dashboard looks on this machine for vLLM, SGLang, Maya and the other OpenAI-compatible servers
 # and opens a counting address on the next free port. Programs must use that address.
+# A server that publishes a token counter (SGLang started with --enable-metrics) is still counted
+# when a program talks to the server itself. Those tokens are not counted twice.
 # Ollama's port, the dashboard port, and every counting port are never checked.
 # Add any other app you do not want touched (AUC on 3000, or something already using 8001):
 # Environment=PORT_IGNORE=3000,8001

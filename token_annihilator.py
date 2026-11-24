@@ -33,7 +33,7 @@ DASH_BIND, DASH_PORT = os.environ.get("DASH_BIND") or _default_bind(), int(os.en
 # Set it empty for none. A listen port that is already taken is skipped with a warning; the rest still start.
 OPENAI_PROXIES = os.environ.get("OPENAI_PROXIES")
 INJECT_USAGE = os.environ.get("INJECT_USAGE", "1") != "0"   # add stream_options.include_usage to streaming /v1 requests
-TRACK = ("/api/generate", "/api/chat", "/v1/chat/completions", "/v1/completions", "/v1/responses", "/api/embed", "/api/embeddings", "/v1/embeddings")
+TRACK = ("/api/generate", "/api/chat", "/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages", "/api/embed", "/api/embeddings", "/v1/embeddings")
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-connection"}
 lock = threading.Lock()
 LIVE = {}            # request id -> {model, endpoint, out_est, t0}
@@ -57,7 +57,7 @@ def db():
 V = "source!='backfill' AND COALESCE(status,200)<400"
 SOURCE_LABELS = {"proxy": "Ollama", "ollama": "Ollama", "llamacpp": "llama.cpp", "vllm": "vLLM", "tensorfold": "TensorFold", "nim": "NVIDIA NIM", "nemo": "NeMo",
                  "trtllm": "TensorRT-LLM", "triton": "Triton", "onnx": "ONNX Runtime", "sglang": "SGLang", "lmstudio": "LM Studio",
-                 "openai": "OpenAI-compatible"}   # any other OPENAI_PROXIES name is shown as written
+                 "openai": "OpenAI-compatible", "maya": "Maya"}   # any other OPENAI_PROXIES name is shown as written
 TOT = [0, 0]         # running all-time (input, output) for milestone checks
 RUNTIMES = []        # every proxy we run: {"src", "listen", "up", "cls", "ok", "kind", "error"}
 
@@ -335,31 +335,48 @@ def parse_usage(endpoint, req_body, tail):
     except Exception: pass
     text = tail.decode("utf-8", "replace")
     cands = [text] + [l[5:].strip() if l.startswith("data:") else l for l in reversed(text.splitlines())]
+    got = False
     for cand in cands:
         try: o = json.loads(cand)
         except Exception: continue
         if not isinstance(o, dict): continue
         model = o.get("model") or model
+        if isinstance(o.get("message"), dict):
+            msg = o["message"]   # Anthropic stream: message_start carries the model, and usage, inside message
+            if isinstance(msg, dict):
+                model = msg.get("model") or model
+                if not isinstance(o.get("usage"), dict) and isinstance(msg.get("usage"), dict):
+                    o = dict(o, usage=msg["usage"])
+        if got: continue
         if "prompt_eval_count" in o or "eval_count" in o:
             inp, out = o.get("prompt_eval_count"), o.get("eval_count")
             if o.get("eval_duration"): eval_s = o["eval_duration"] / 1e9
-            break
-        if isinstance(o.get("response"), dict):   # /v1/responses stream: the usage rides on response.completed
+            got = True
+        elif isinstance(o.get("response"), dict) and isinstance(o["response"].get("usage"), dict):   # /v1/responses stream
             o = o["response"]; model = o.get("model") or model
-        u = o.get("usage")
-        if isinstance(u, dict) and "input_tokens" in u:   # Responses API naming
-            inp, out = u.get("input_tokens"), u.get("output_tokens", 0)
-            break
-        if isinstance(u, dict):
-            inp, out = u.get("prompt_tokens"), u.get("completion_tokens", 0)
-            tm = o.get("timings")   # llama-server extra
-            if isinstance(tm, dict) and tm.get("predicted_ms"): eval_s = tm["predicted_ms"] / 1e3
-            break
+            u = o.get("usage")
+            if "input_tokens" in u:
+                inp, out = u.get("input_tokens"), u.get("output_tokens", 0); got = True
+        else:
+            u = o.get("usage")
+            if isinstance(u, dict) and "input_tokens" in u:   # Responses API, and Anthropic /v1/messages
+                extra = 0
+                for k in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+                    try: extra += int(u.get(k) or 0)
+                    except (TypeError, ValueError): pass
+                inp, out = (u.get("input_tokens") or 0) + extra, u.get("output_tokens", 0)
+                got = True
+            elif isinstance(u, dict) and ("prompt_tokens" in u or "completion_tokens" in u):
+                inp, out = u.get("prompt_tokens"), u.get("completion_tokens", 0)
+                tm = o.get("timings")   # llama-server extra
+                if isinstance(tm, dict) and tm.get("predicted_ms"): eval_s = tm["predicted_ms"] / 1e3
+                got = True
+        if got and model: break
     return model, inp, out, eval_s
 
 def add_usage_opt(path, body):
     """vLLM, SGLang and llama-server only report usage on a stream when asked. Ask politely; never break the request."""
-    if not INJECT_USAGE or not body or not path.startswith("/v1/") or "embed" in path or path.endswith("/responses"): return body
+    if not INJECT_USAGE or not body or not path.startswith("/v1/") or "embed" in path or path.endswith("/responses") or path.endswith("/messages"): return body
     try:
         j = json.loads(body)
         if isinstance(j, dict) and j.get("stream") and "stream_options" not in j:
@@ -441,6 +458,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                     # vLLM reports no timings. The first chunk lands after prefill, so first->last chunk is decode time
                     # for out-1 tokens; scale it up to all out tokens.
                     eval_s = (t_last - t_first) * out / (out - 1)
+                if r.status < 400: note_proxied(self.UPH, self.UPP, inp, out)
                 new_ms = log_row(ts=t0, model=model, endpoint=path, inp=inp, out=out, dur=time.time() - t0, eval_s=eval_s, status=r.status, source=src)
                 with LIVE_LOCK:
                     est = (LIVE.pop(rid, None) or {}).get("out_est", 0); live_bump()   # tokens the gauge already saw stream in
@@ -749,9 +767,14 @@ def probe_models(host, port, timeout=None):
     for m in o["data"]:
         if isinstance(m, dict): owners.add(str(m.get("owned_by", "")).lower())
     if "tensorfold" in owners or "tensorfold" in server: return "tensorfold"
-    for k in ("vllm", "sglang", "llamacpp", "ollama"):
+    for k in ("vllm", "sglang", "llamacpp", "ollama", "maya"):
         if k in owners: return k
     if "sglang" in server: return "sglang"
+    if "maya" in server: return "maya"
+    # Maya's model list has no owned_by. A card with architecture and status.value is that shape.
+    for m in o["data"]:
+        if isinstance(m, dict) and isinstance(m.get("architecture"), dict) and isinstance(m.get("status"), dict) and "value" in m["status"]:
+            return "maya"
     return "openai"
 
 def port_available(port):
@@ -878,6 +901,144 @@ def scan_once(ports=None):
         known.add(port)
     return probed
 
+# Token counters a server publishes (Prometheus text). Direct traffic, which never touches the counting
+# address, still shows up here. The first read is a baseline and is not counted. Later growth, minus what
+# the counting address already logged, is the part that bypassed it.
+COUNTER_PAIRS = (
+    ("sglang:prompt_tokens_total", "sglang:generation_tokens_total"),
+    ("vllm:prompt_tokens_total", "vllm:generation_tokens_total"),
+    ("llamacpp:prompt_tokens_total", "llamacpp:tokens_predicted_total"),
+)
+METRIC_KINDS = {"sglang", "vllm", "llamacpp", "maya", "openai", "tensorfold"}
+PROM_LINE = re.compile(r"^([^{\s]+)(?:\{([^}]*)\})?\s+([-+0-9.eE]+)")
+METRIC_BASE = {}    # (host, port) -> {model: (prompt_total, generation_total)}
+METRIC_CARRY = {}   # (host, port) -> [input, output] the proxy logged that the counter has not caught up to
+PROXIED = {}        # (host, port) -> [input, output] logged by the counting address since the last read
+NO_METRICS = {}     # (host, port) -> time we last looked and found no counter
+
+def note_proxied(host, port, inp, out):
+    """Remember tokens the counting address already wrote down, so a server counter does not count them again."""
+    if not host or port is None: return
+    if inp is None and out is None: return
+    with lock:
+        slot = PROXIED.setdefault((host, int(port)), [0, 0])
+        slot[0] += int(inp or 0); slot[1] += int(out or 0)
+
+def parse_prom_counters(text):
+    """Sum the first known prompt/generation counter pair, by model_name. None when the text has neither."""
+    if not text: return None
+    found = None
+    for pair in COUNTER_PAIRS:
+        if pair[0] in text and pair[1] in text:
+            found = pair; break
+    if not found: return None
+    acc = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"): continue
+        m = PROM_LINE.match(line)
+        if not m or m.group(1) not in found: continue
+        labels = m.group(2) or ""
+        mm = re.search(r'(?:model_name|model)="([^"]*)"', labels)
+        model = (mm.group(1) if mm and mm.group(1) else "") or "unknown"
+        try: val = float(m.group(3))
+        except ValueError: continue
+        slot = acc.setdefault(model, [0.0, 0.0])
+        slot[0 if m.group(1) == found[0] else 1] += val
+    return {k: (int(round(v[0])), int(round(v[1]))) for k, v in acc.items()}
+
+def direct_from_counters(prev, new, credit):
+    """Growth since prev, minus credit the proxy already logged. Returns rows and leftover credit.
+    A counter that went backwards (the server restarted) is treated as a new baseline, not a negative."""
+    deltas = []
+    for model, (ni, no) in new.items():
+        oi, oo = prev.get(model, (0, 0))
+        di, do = ni - oi, no - oo
+        if di < 0: di = 0
+        if do < 0: do = 0
+        if di or do: deltas.append([model, di, do, ni, no])
+    tin, tout = sum(d[1] for d in deltas), sum(d[2] for d in deltas)
+    cin, cout = credit
+    direct_in, direct_out = tin - cin, tout - cout
+    carry = [max(0, -direct_in), max(0, -direct_out)]
+    direct_in, direct_out = max(0, direct_in), max(0, direct_out)
+    def scale(idx, total, direct):
+        if total <= 0 or direct <= 0:
+            for d in deltas: d[idx] = 0
+            return
+        if direct >= total: return
+        raw = [d[idx] * direct / total for d in deltas]
+        floors = [int(x) for x in raw]
+        rem = direct - sum(floors)
+        for i in sorted(range(len(deltas)), key=lambda i: (raw[i] - floors[i], -i), reverse=True)[:rem]:
+            floors[i] += 1
+        for i, d in enumerate(deltas): d[idx] = floors[i]
+    scale(1, tin, direct_in); scale(2, tout, direct_out)
+    return [(d[0], d[1], d[2], d[3], d[4]) for d in deltas if d[1] or d[2]], carry
+
+def _metrics_text(host, port):
+    """Read /metrics, then /metrics/prometheus, and keep the body only when it has a token counter. Read-only."""
+    for path in ("/metrics", "/metrics/prometheus"):
+        c = http.client.HTTPConnection(host, int(port), timeout=0.8)
+        try:
+            c.request("GET", path)
+            r = c.getresponse()
+            body = r.read(1_000_000)
+            status = r.status
+        except Exception:
+            continue
+        finally:
+            try: c.close()
+            except Exception: pass
+        if status != 200: continue
+        text = body.decode("utf-8", "replace")
+        if parse_prom_counters(text) is not None: return text
+    return None
+
+def apply_metric_text(host, port, kind, text):
+    """Turn one counter reading into rows for traffic the counting address did not already log.
+    The first reading only remembers the totals."""
+    totals = parse_prom_counters(text)
+    if totals is None: return []
+    key = (host, int(port))
+    prev = METRIC_BASE.get(key)
+    METRIC_BASE[key] = totals
+    if prev is None: return []
+    with lock:
+        credit = PROXIED.pop(key, [0, 0])
+        carry = METRIC_CARRY.get(key, [0, 0])
+    rows, new_carry = direct_from_counters(prev, totals, [credit[0] + carry[0], credit[1] + carry[1]])
+    METRIC_CARRY[key] = new_carry
+    logged = []
+    for model, inp, out, pin, pout in rows:
+        log_row(ts=time.time(), model=model, endpoint="/metrics", inp=inp, out=out, status=200, source=kind,
+                dedupe="metrics:%s:%d:%s:%d:%d" % (host, int(port), model, pin, pout))
+        logged.append((model, inp, out))
+    return logged
+
+def metrics_pass():
+    """Read token counters for servers we already count. Skips the leave-alone list. A miss waits five minutes."""
+    now = time.time()
+    quiet = configured_ignore()
+    for rt in list(RUNTIMES):
+        if not rt.get("started") or not rt.get("up"): continue
+        if rt.get("src") not in METRIC_KINDS: continue
+        host, port = rt["up"]
+        if int(port) in quiet: continue
+        key = (host, int(port))
+        if key in NO_METRICS and now - NO_METRICS[key] < 300: continue
+        text = _metrics_text(host, port)
+        if text is None:
+            NO_METRICS[key] = now; continue
+        NO_METRICS.pop(key, None)
+        try:
+            if apply_metric_text(host, port, rt.get("src") or "openai", text):
+                rt["metrics"] = True
+            elif key in METRIC_BASE:
+                rt["metrics"] = True
+        except Exception as e:
+            print("metrics read error:", e, file=sys.stderr, flush=True)
+
 def watch_loop():
     tick = 0
     while True:
@@ -885,7 +1046,9 @@ def watch_loop():
             apply_port_config()
             if auto_detect_on(): scan_once()
             tick += 1
-            if tick % 6 == 1: check_runtimes()
+            if tick % 6 == 1:
+                check_runtimes()
+                metrics_pass()
         except Exception as e: print("port watch error:", e, file=sys.stderr, flush=True)
         time.sleep(SCAN_EVERY)
 
@@ -894,7 +1057,8 @@ def server_rows():
     for rt in list(RUNTIMES):
         rows.append({"label": SOURCE_LABELS.get(rt["src"], rt["src"]), "src": rt["src"], "listen": rt.get("listen"),
                      "up": "%s:%d" % rt["up"], "upstream_port": rt["up"][1], "ok": rt.get("ok"), "error": rt.get("error"),
-                     "how": rt.get("how") or "", "counting": counting_url(rt["listen"]) if rt.get("started") else None, "detail": ""})
+                     "how": rt.get("how") or "", "counting": counting_url(rt["listen"]) if rt.get("started") else None,
+                     "detail": "Traffic sent straight to this server is counted from its token counter." if rt.get("metrics") else ""})
     rows.extend(LOG_ONLY)
     return rows
 
@@ -1429,9 +1593,9 @@ function pLoad(r){const p=r.ports||{auto:true,ignore:[],manual:[],listen:{},serv
  manual:(p.manual||[]).map(m=>({name:m.name||'',host:m.host||'127.0.0.1',port:m.port!=null?String(m.port):'',listen:m.listen?String(m.listen):''})),
  overs:Object.entries(p.listen||{}).map(([up,listen])=>({up:String(up),listen:String(listen)})),servers:p.servers||[]};pRender()}
 function pServers(){const box=$('portServers');if(!box||!PF)return;box.innerHTML=(PF.servers||[]).map(s=>{const addr=s.counting?`<b>${esc(s.counting)}</b> <button type=button class="btn xs" data-copy="${esc(s.counting)}">Copy</button>`:(s.detail?esc(s.detail):'no counting address');
- return `<div class=prow><b>${esc(s.label||s.src||'Server')}</b><span>server port ${esc(s.upstream_port!=null?s.upstream_port:(s.up||''))}</span><span>${addr}</span>${s.error?`<span class=busy>${esc(s.error)}</span>`:''}</div>`}).join('')||'<div class=sh>None yet. A model server on this machine shows up here within a few seconds.</div>'}
+ return `<div class=prow><b>${esc(s.label||s.src||'Server')}</b><span>server port ${esc(s.upstream_port!=null?s.upstream_port:(s.up||''))}</span><span>${addr}</span>${s.detail?`<span>${esc(s.detail)}</span>`:''}${s.error?`<span class=busy>${esc(s.error)}</span>`:''}</div>`}).join('')||'<div class=sh>None yet. A model server on this machine shows up here within a few seconds.</div>'}
 function pRender(){if(!PF)return;$('portBox').innerHTML=`<fieldset class=sg><legend>Ports</legend>
-<p class=sh style="font-size:13px;color:#ffe0b0">Programs are counted only when they use the <b>counting address</b>. The model server keeps its own port. This page only reads <code>/v1/models</code>. It never sends a prompt and never takes the server's port.</p>
+<p class=sh style="font-size:13px;color:#ffe0b0">Programs are counted only when they use the <b>counting address</b>. The model server keeps its own port. This page only reads <code>/v1/models</code> and, when a server publishes one, its token counter. It never sends a prompt and never takes the server's port. Traffic sent straight to a server that publishes a counter is still counted, without counting the counting address twice.</p>
 <label class=sr><input type=checkbox id=portAuto ${PF.auto?'checked':''}> Look for model servers on this machine</label>
 <div class=sh>Found servers</div><div id=portServers></div>
 <div class=sh>Ports to leave alone</div>
