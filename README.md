@@ -104,7 +104,7 @@ On GitHub: Releases → Draft a new release → choose the tag `v1.2.0` → Publ
 
 The usual way needs no port numbers from you. Leave the dashboard running. Every few seconds it looks at which ports on this machine are open, and asks each one (with a single read of `/v1/models`) whether a model server is there. For each one it finds, it opens a **counting address** on the next free port. vLLM, SGLang, TensorFold, llama.cpp's server, and anything else that answers like them get their own label.
 
-The page shows a yellow notice only when a detected or configured server still has no counting address, and lists those servers. Dismiss remembers that list in the browser; a new uncounted server, or a new warning, brings the notice back. **A program is counted only when it uses the counting address** (or when the server publishes a token counter). Traffic sent straight to a server with no counter is invisible. The counting addresses, with a Copy button, are on the page and in Settings (the gear).
+The page shows a yellow notice only when a detected or configured server still has no counting address, and lists those servers. Dismiss remembers that list in the browser; a new uncounted server, or a new warning, brings the notice back. **A program is counted only when it uses the counting address** (or when the server publishes a token counter). Traffic sent straight to a server with no counter is invisible. The counting addresses, with a Copy button, are in Settings (the gear).
 
 The model server is never restarted, never sent a prompt, and never has its own port taken over.
 
@@ -165,7 +165,7 @@ export OLLAMA_HOST=127.0.0.1:11435
 
 ### vLLM
 
-vLLM stays where it is. The usual port is **8000**. The dashboard does not change vLLM. With the search on, the counting address is the next free port (8001 when 8001 is free) and it is shown on the page. With the search off, it opens **8001**. Either way it writes down tokens that pass through that address.
+vLLM stays where it is. The usual port is **8000**. The dashboard does not change vLLM. With the search on, the counting address is the next free port (8001 when 8001 is free) and it is shown in Settings. With the search off, it opens **8001**. Either way it writes down tokens that pass through that address.
 
 A request sent straight to 8000 is invisible here. Point the program at 8001.
 

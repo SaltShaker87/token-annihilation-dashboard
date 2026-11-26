@@ -1396,7 +1396,6 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;ma
 .scroll{max-height:380px;overflow:auto;border-radius:10px;scrollbar-color:#2f4a10 #0b0d10}.scroll .muted td{position:sticky;top:0;background:#14171d;z-index:1}#ledger{max-height:420px}#ledger .muted td{background:#0b0d10}
 .rts{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;margin-left:auto}.chip.down{border-style:dashed;color:#6b7285;border-color:#2a2f3a;background:none}.chip.busy{color:#ffb84d;border-color:#6b4a00;background:#2a1d00}
 .countwarn{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid #6b4a00;background:#2a1d00;color:#ffe0b0;border-radius:12px;padding:10px 14px;margin:14px 0 0;font-size:14px;line-height:1.45}.countwarn[hidden]{display:none}.countwarn b{color:#ffb84d}.countwarnbody{flex:1;min-width:0}.countwarnlist{margin:8px 0 0;padding-left:1.2em}#countWarnX{flex:none}
-#countList{margin-top:8px}#countList .btn{margin-left:6px}
 #setDlg input[type=checkbox]{width:auto;margin:0 8px 0 0}#setDlg input.wide{width:100%;margin:4px 0;box-sizing:border-box}
 #portBox .sh{margin-top:8px}#portServers{display:flex;flex-direction:column;gap:6px;margin:8px 0}#portServers .prow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;border:1px solid #232833;border-radius:10px;padding:8px 10px}
 #portBox .sr input{min-width:0}
@@ -1465,7 +1464,6 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 <div class=top><div class=brand><div class=mascot id=mascot><img id=mascotImg src="static/mascot-idle.webp" width=80 height=80 alt="Angry chip robot inhaling tokens"></div><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Preview a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
 <div class=fbar><div class=seg id=seg><button data-d=1>24 hours</button><button data-d=7>7 days</button><button data-d=30>30 days</button><button data-d=60>60 days</button><button data-d=90>90 days</button><button data-d=0>All time</button></div><span class=muted id=segSub></span><div class=rts id=rts></div></div>
 <div class=countwarn id=countWarn hidden><div class=countwarnbody><b>Counted only at the counting address.</b> A program that talks straight to the model server is invisible here. These servers are not behind a counting address yet:<ul class=countwarnlist id=countWarnList></ul></div><button type=button class="btn xs" id=countWarnX aria-label="Dismiss">✕</button></div>
-<div class=chips id=countList></div>
 <div class="row r1">
  <div class=card id=odoCard><h2 id=odoH>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=words id=odoWords></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
   <div class=lbl id=rngLbl style="margin-top:14px;color:#9fd14a"></div><div class=grid style="margin-top:6px"><div><div class=lbl>Prompts devoured (input)</div><div class=med id=tin></div></div><div><div class=lbl>Vocabulary purged (output)</div><div class=med id=tout></div></div><div><div class=lbl>Lineages erased (requests)</div><div class=med id=nreq></div></div><div><div class=lbl>Avg extermination speed</div><div class=med id=avg></div></div></div></div>
@@ -1581,7 +1579,6 @@ $('msToggle').onclick=()=>{msOpen=!msOpen;renderMs()}
 function msNext(c,cur){let best=Infinity,prev=0;for(const v of c.fixed)if(v>cur&&v<best)best=v;for(const [hi,st] of c.tiers){const v=(Math.floor(Math.max(cur,prev)/st)+1)*st;if(hi==null||v<=hi){if(v<best)best=v;break}prev=hi}return best}
 function nextMilestone(){const tok=tin+tout,sv=hero?cost(hero,tin,tout):0,C=ST.ms_cfg;const nt=msNext(C.tok,tok),ns=msNext(C.usd,sv);
  $('nextMs').textContent=`Next party: ${bigNum(nt).toLowerCase()} tokens (${fmt(nt-tok)} to go)`+(hero?` · $${fmt(ns)} saved ($${(ns-sv).toFixed(2)} to go)`:'')}
-function renderCount(){const rows=(ST.runtimes||[]).filter(r=>r.counting);$('countList').innerHTML=rows.map(r=>`<span class=chip>${esc(r.label)} <b>${esc(r.counting)}</b> <button type=button class="btn xs" data-copy="${esc(r.counting)}">Copy</button></span>`).join('')||'<span class="chip soon">No counting address yet. When a model server is running on this machine, its address shows up here.</span>'}
 function countWarnSig(rows){return 'Counted only at the counting address\n'+rows.map(r=>(r.label||'')+' @ '+(r.up||'')+' '+(r.reason||'')).sort().join('\n')}
 function renderCountWarn(){const el=$('countWarn'),list=$('countWarnList'),rows=ST.uncounted||[];
  if(!el)return;
@@ -1590,7 +1587,7 @@ function renderCountWarn(){const el=$('countWarn'),list=$('countWarnList'),rows=
  if(dismissed){el.hidden=true;return}
  if(list)list.innerHTML=rows.map(r=>`<li>${esc(r.label||'Server')} at ${esc(r.up||'?')}${r.reason?' — '+esc(r.reason):''}</li>`).join('');
  el.hidden=false}
-function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();renderCount();renderCountWarn();nextMilestone()}
+function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();renderCountWarn();nextMilestone()}
 $('countWarnX')&&($('countWarnX').onclick=()=>{const rows=ST.uncounted||[];try{localStorage.setItem('tad.countwarn',countWarnSig(rows))}catch(_){}$('countWarn').hidden=true});
 document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;const t=b.getAttribute('data-copy'),old=b.textContent;const done=()=>{b.textContent='Copied';setTimeout(()=>{b.textContent=old},1200)};
  const fb=()=>{const i=document.createElement('textarea');i.value=t;document.body.appendChild(i);i.select();try{document.execCommand('copy');done()}catch(_){}i.remove()};

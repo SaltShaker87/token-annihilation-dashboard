@@ -2118,5 +2118,32 @@ class UsageAndMetricsTests(unittest.TestCase):
             ta.MS_SAVED.clear(); ta.MS_SAVED.update(ms); ta.ms_apply()
 
 
+class CountingAddressDisplayTests(unittest.TestCase):
+    """Counting addresses with Copy buttons belong in Settings, not on the main page."""
+
+    def test_page_keeps_copy_buttons_in_settings_only(self):
+        old = ta.DB
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                ta.DB = os.path.join(tmp, "s.db")
+                ta.db().close()
+                ta.init_db()
+                html = ta.page()
+            finally:
+                ta.DB = old
+        self.assertNotIn("id=countList", html)
+        self.assertNotIn("#countList", html)
+        self.assertNotIn("function renderCount(", html)
+        self.assertNotIn("$('countList')", html)
+        self.assertNotRegex(html, r"renderCount\s*\(")
+        self.assertIn("id=portServers", html)
+        self.assertIn("function pServers()", html)
+        self.assertIn("data-copy", html)
+        self.assertIn(">Copy</button>", html)
+        self.assertIn("Found servers", html)
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
