@@ -592,6 +592,40 @@ def counting_url(port):
     if not port: return None
     return "http://127.0.0.1:%d/v1" % int(port)
 
+def forget_found_note(port):
+    port = int(port)
+    FOUND_NOTES[:] = [n for n in FOUND_NOTES if n.get("upstream_port") != port]
+
+def remember_found_note(kind, port, detail):
+    """Keep a skipped detected server visible until it disappears or gets a counting address."""
+    forget_found_note(port)
+    FOUND_NOTES.append(_note(kind, port, "found", detail))
+
+def uncounted_servers():
+    """Detected or configured servers that are not behind a counting address and are not counted another way.
+
+    The yellow banner used to show for everyone, even when every server already had a counting
+    address. The page now hides that notice unless this list is non-empty.
+    """
+    out, seen = [], set()
+    def add(label, up, reason):
+        key = (label, up)
+        if key in seen: return
+        seen.add(key)
+        out.append({"label": label, "up": up, "reason": reason})
+    for rt in list(RUNTIMES):
+        if rt.get("started") and rt.get("listen"):
+            continue
+        up = rt.get("up")
+        if isinstance(up, tuple): up = "%s:%d" % up
+        reason = rt.get("error") or "waiting for the server to answer"
+        add(SOURCE_LABELS.get(rt["src"], rt["src"]), up or "", reason)
+    for n in list(FOUND_NOTES) + list(LOG_ONLY):
+        if n.get("how") in ("ollama", "log") or n.get("counting"):
+            continue
+        add(n.get("label") or n.get("src") or "server", n.get("up") or "", n.get("detail") or "no counting address")
+    return out
+
 def _port_num(v, label):
     if isinstance(v, bool) or not isinstance(v, (int, float, str)): raise ValueError("%s must be a port number" % label)
     try: n = int(str(v).strip())
@@ -873,6 +907,8 @@ def scan_once(ports=None):
     if not auto_detect_on(): return []
     skip = skip_ports()
     known = {rt["up"][1] for rt in list(RUNTIMES) if rt.get("up") and rt["up"][0] in ("127.0.0.1", "localhost")}
+    listening = set(listening_local_ports() if ports is None else ports)
+    FOUND_NOTES[:] = [n for n in FOUND_NOTES if n.get("upstream_port") in listening and n.get("upstream_port") not in known]
     probed = []
     now = time.time()
     for port in sorted(listening_local_ports() if ports is None else ports):
@@ -892,11 +928,17 @@ def scan_once(ports=None):
         prefer = listen_overrides().get(port)
         if prefer and (prefer in skip or prefer == port or not port_available(prefer)):
             print("warning: %s on port %d skipped, counting port %d is not free. The dashboard keeps running." % (SOURCE_LABELS.get(kind, kind), port, prefer), file=sys.stderr, flush=True)
-            LOG_ONLY.append(_note(kind, port, "found", "Counting port %d is not free. Pick another one in Settings." % prefer))
+            detail = "Counting port %d is not free. Pick another one in Settings." % prefer
+            LOG_ONLY.append(_note(kind, port, "found", detail))
+            remember_found_note(kind, port, detail)
             _NEG[port] = now; continue
         listen = choose_listen(port, prefer)
         if listen is None:
+            detail = "No free counting port nearby. Pick one in Settings."
+            LOG_ONLY.append(_note(kind, port, "found", detail))
+            remember_found_note(kind, port, detail)
             _NEG[port] = now; continue
+        forget_found_note(port)
         open_counting_proxy(kind, "127.0.0.1", port, listen, "found")
         known.add(port)
     return probed
@@ -1060,6 +1102,10 @@ def server_rows():
                      "how": rt.get("how") or "", "counting": counting_url(rt["listen"]) if rt.get("started") else None,
                      "detail": "Traffic sent straight to this server is counted from its token counter." if rt.get("metrics") else ""})
     rows.extend(LOG_ONLY)
+    have = {(r.get("up"), r.get("how")) for r in rows}
+    for n in FOUND_NOTES:
+        if (n.get("up"), n.get("how")) not in have:
+            rows.append(n)
     return rows
 
 def ports_public():
@@ -1195,7 +1241,7 @@ def stats(c, since=None):
     # "sched": on the current schedule. Older, denser milestones stay in the table (never deleted) but are not badges or popups.
     ms = [{"key": k, "kind": kd, "value": v, "reached_ts": rt, "acked": at is not None, "sched": int(v) in sched.get(kd, ())} for k, kd, v, rt, at in rows]
     return {"records": R, "leaderboard": board(W) if since else L, "rng": rng, "sources": sources, "trip": trip, "trips": hist[:12], "milestones": ms, "ms_cfg": MS_CFG,
-            "runtimes": runtimes_info(c)}
+            "runtimes": runtimes_info(c), "uncounted": uncounted_servers()}
 
 def page_data():
     c = db(); q = lambda s, *a: c.execute(s, a).fetchall()
@@ -1349,7 +1395,7 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b5;ma
 .x10{flex:none;margin-left:calc(var(--dw)/3);white-space:nowrap;font-size:calc(var(--dh)*.6)}.x10 sup{font-size:.6em;vertical-align:.9em;margin-left:2px}.odo.sci .dig:last-of-type{box-shadow:0 0 0 1px #3f7a00}.dig.tick{animation:tick .5s}@keyframes tick{0%{box-shadow:0 0 8px 2px var(--g)}100%{box-shadow:0 0 0 1px #3f7a00}}.words{color:#9fd14a;font-size:13px;font-weight:600}
 .scroll{max-height:380px;overflow:auto;border-radius:10px;scrollbar-color:#2f4a10 #0b0d10}.scroll .muted td{position:sticky;top:0;background:#14171d;z-index:1}#ledger{max-height:420px}#ledger .muted td{background:#0b0d10}
 .rts{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;margin-left:auto}.chip.down{border-style:dashed;color:#6b7285;border-color:#2a2f3a;background:none}.chip.busy{color:#ffb84d;border-color:#6b4a00;background:#2a1d00}
-.countwarn{border:1px solid #6b4a00;background:#2a1d00;color:#ffe0b0;border-radius:12px;padding:10px 14px;margin:14px 0 0;font-size:14px;line-height:1.45}.countwarn b{color:#ffb84d}
+.countwarn{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid #6b4a00;background:#2a1d00;color:#ffe0b0;border-radius:12px;padding:10px 14px;margin:14px 0 0;font-size:14px;line-height:1.45}.countwarn[hidden]{display:none}.countwarn b{color:#ffb84d}.countwarnbody{flex:1;min-width:0}.countwarnlist{margin:8px 0 0;padding-left:1.2em}#countWarnX{flex:none}
 #setDlg input[type=checkbox]{width:auto;margin:0 8px 0 0}#setDlg input.wide{width:100%;margin:4px 0;box-sizing:border-box}
 #portBox .sh{margin-top:8px}#portServers{display:flex;flex-direction:column;gap:6px;margin:8px 0}#portServers .prow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;border:1px solid #232833;border-radius:10px;padding:8px 10px}
 #portBox .sr input{min-width:0}
@@ -1417,7 +1463,7 @@ dialog{background:#14171d;color:#e6e6e6;border:1px solid var(--g);border-radius:
 </style></head><body>
 <div class=top><div class=brand><div class=mascot id=mascot><img id=mascotImg src="static/mascot-idle.webp" width=80 height=80 alt="Angry chip robot inhaling tokens"></div><div><h1>DGX Token Annihilator Dashboard</h1><div class=muted id=sub></div></div></div><div class=acts><button class=btn id=share title="Preview a PNG of your carnage">📸 Share the carnage</button><span class=badge id=conn>Connecting to the extinction feed...</span></div></div>
 <div class=fbar><div class=seg id=seg><button data-d=1>24 hours</button><button data-d=7>7 days</button><button data-d=30>30 days</button><button data-d=60>60 days</button><button data-d=90>90 days</button><button data-d=0>All time</button></div><span class=muted id=segSub></span><div class=rts id=rts></div></div>
-<p class=countwarn id=countWarn><b>Counted only at the counting address.</b> A program that talks straight to the model server is invisible here. Open Settings to copy a counting address, add a server, or leave ports alone.</p>
+<div class=countwarn id=countWarn hidden><div class=countwarnbody><b>Counted only at the counting address.</b> A program that talks straight to the model server is invisible here. These servers are not behind a counting address yet:<ul class=countwarnlist id=countWarnList></ul></div><button type=button class="btn xs" id=countWarnX aria-label="Dismiss">✕</button></div>
 <div class="row r1">
  <div class=card id=odoCard><h2 id=odoH>Tokens obliterated (all time, forever, no refunds)</h2><div class=odo id=odo></div><div class=words id=odoWords></div><div class=muted id=odoSub></div><div class=muted id=nextMs style="color:#9fd14a"></div>
   <div class=lbl id=rngLbl style="margin-top:14px;color:#9fd14a"></div><div class=grid style="margin-top:6px"><div><div class=lbl>Prompts devoured (input)</div><div class=med id=tin></div></div><div><div class=lbl>Vocabulary purged (output)</div><div class=med id=tout></div></div><div><div class=lbl>Lineages erased (requests)</div><div class=med id=nreq></div></div><div><div class=lbl>Avg extermination speed</div><div class=med id=avg></div></div></div></div>
@@ -1533,7 +1579,16 @@ $('msToggle').onclick=()=>{msOpen=!msOpen;renderMs()}
 function msNext(c,cur){let best=Infinity,prev=0;for(const v of c.fixed)if(v>cur&&v<best)best=v;for(const [hi,st] of c.tiers){const v=(Math.floor(Math.max(cur,prev)/st)+1)*st;if(hi==null||v<=hi){if(v<best)best=v;break}prev=hi}return best}
 function nextMilestone(){const tok=tin+tout,sv=hero?cost(hero,tin,tout):0,C=ST.ms_cfg;const nt=msNext(C.tok,tok),ns=msNext(C.usd,sv);
  $('nextMs').textContent=`Next party: ${bigNum(nt).toLowerCase()} tokens (${fmt(nt-tok)} to go)`+(hero?` · $${fmt(ns)} saved ($${(ns-sv).toFixed(2)} to go)`:'')}
-function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();nextMilestone()}
+function countWarnSig(rows){return 'Counted only at the counting address\n'+rows.map(r=>(r.label||'')+' @ '+(r.up||'')+' '+(r.reason||'')).sort().join('\n')}
+function renderCountWarn(){const el=$('countWarn'),list=$('countWarnList'),rows=ST.uncounted||[];
+ if(!el)return;
+ if(!rows.length){el.hidden=true;if(list)list.innerHTML='';return}
+ let dismissed=false;try{dismissed=localStorage.getItem('tad.countwarn')===countWarnSig(rows)}catch(_){}
+ if(dismissed){el.hidden=true;return}
+ if(list)list.innerHTML=rows.map(r=>`<li>${esc(r.label||'Server')} at ${esc(r.up||'?')}${r.reason?' — '+esc(r.reason):''}</li>`).join('');
+ el.hidden=false}
+function renderAll(){renderLB();renderRec();renderTrip();renderMs();renderRt();renderCountWarn();nextMilestone()}
+$('countWarnX')&&($('countWarnX').onclick=()=>{const rows=ST.uncounted||[];try{localStorage.setItem('tad.countwarn',countWarnSig(rows))}catch(_){}$('countWarn').hidden=true});
 document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;const t=b.getAttribute('data-copy'),old=b.textContent;const done=()=>{b.textContent='Copied';setTimeout(()=>{b.textContent=old},1200)};
  const fb=()=>{const i=document.createElement('textarea');i.value=t;document.body.appendChild(i);i.select();try{document.execCommand('copy');done()}catch(_){}i.remove()};
  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(done).catch(fb);else fb()});

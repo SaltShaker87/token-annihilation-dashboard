@@ -1927,6 +1927,57 @@ class PortDetectTests(unittest.TestCase):
         stop.set()
 
 
+class UncountedBannerTests(unittest.TestCase):
+    """The yellow counting-address banner is only for servers that are not yet counted."""
+
+    def setUp(self):
+        self.saved = (list(ta.RUNTIMES), list(ta.LOG_ONLY), list(ta.FOUND_NOTES))
+        ta.RUNTIMES[:] = []; ta.LOG_ONLY[:] = []; ta.FOUND_NOTES[:] = []
+
+    def tearDown(self):
+        ta.RUNTIMES[:], ta.LOG_ONLY[:], ta.FOUND_NOTES[:] = self.saved
+
+    def test_all_started_proxies_are_counted_even_if_upstream_is_down(self):
+        ta.RUNTIMES[:] = [
+            {"src": "vllm", "listen": 8889, "up": ("10.20.0.3", 8888), "started": True, "ok": True},
+            {"src": "bolt", "listen": 8890, "up": ("192.168.68.213", 8000), "started": True, "ok": False},
+            {"src": "llm4d", "listen": 8891, "up": ("192.168.68.213", 8001), "started": True, "ok": False},
+            {"src": "nemotron", "listen": 8892, "up": ("10.20.0.2", 8888), "started": True, "ok": True},
+        ]
+        self.assertEqual(ta.uncounted_servers(), [])
+
+    def test_busy_or_skipped_servers_are_listed(self):
+        ta.RUNTIMES[:] = [{"src": "vllm", "listen": 8001, "up": ("127.0.0.1", 8000), "started": False, "error": "port 8001 busy"}]
+        ta.remember_found_note("sglang", 30000, "Counting port 30001 is not free. Pick another one in Settings.")
+        rows = ta.uncounted_servers()
+        by_up = {r["up"]: r for r in rows}
+        self.assertEqual(set(by_up), {"127.0.0.1:8000", "127.0.0.1:30000"})
+        self.assertIn("busy", by_up["127.0.0.1:8000"]["reason"])
+        self.assertIn("30001", by_up["127.0.0.1:30000"]["reason"])
+
+    def test_ollama_proxy_and_llamacpp_log_are_not_uncounted(self):
+        ta.LOG_ONLY[:] = [
+            ta._note("ollama", 11434, "ollama", "Ollama keeps its own counting address on port 11435."),
+            ta._note("llamacpp", 8080, "log", "Counted from the llama.cpp log."),
+        ]
+        self.assertEqual(ta.uncounted_servers(), [])
+
+    def test_page_has_hidden_dismissible_banner(self):
+        tmp = tempfile.mkdtemp(prefix="banner-"); old = ta.DB
+        try:
+            ta.DB = os.path.join(tmp, "s.db"); ta.db().close(); ta.init_db()
+            html = ta.page()
+        finally:
+            ta.DB = old
+        self.assertIn("Counted only at the counting address", html)
+        self.assertIn("id=countWarn hidden", html)
+        self.assertIn("id=countWarnX", html)
+        self.assertIn('aria-label="Dismiss"', html)
+        self.assertIn("tad.countwarn", html)
+        self.assertIn("renderCountWarn", html)
+
+
+
 class UsageAndMetricsTests(unittest.TestCase):
     """Anthropic messages, a Maya model list, and a server token counter. Direct traffic is counted once."""
 
